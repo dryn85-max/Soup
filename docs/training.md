@@ -121,8 +121,18 @@ read training generations only. `ppo` and `online_dpo` refuse
 `evaluate()` crashes on prompt-only rows. A generation-based evaluation for
 those two is a separate feature.
 
-**Refused at config load.** `training.eval_steps` on `backend: mlx` (mlx-lm
-evaluates the split on its own cadence, #739), on `task: unlearn` (it trains on
+**On `backend: mlx`** (#1990) `task: sft` honours `training.eval_steps` in the
+same unit: completed optimizer updates, after gradient accumulation. Soup runs
+those evaluations itself, after updates N, 2N, ... and once after the last
+update, over every validation row (a tail smaller than one batch included),
+weighted by supervised tokens. mlx-lm's own pass would evaluate before the
+update it is scheduled at and read at most 25 whole batches. An evaluation
+takes no step and leaves the training order and the model's mode as they were.
+Unset, MLX keeps mlx-lm's cadence (a quarter of the run). The MLX preference
+tasks (`dpo`, `orpo`) evaluate once per epoch and refuse the field.
+
+**Refused at config load.** `training.eval_steps` on the MLX preference tasks
+(see above), on `task: unlearn` (it trains on
 `forget_set` / `retain_set` and has no validation split), and with
 `val_split: 0` on local files or remote URIs, where there would be nothing to
 evaluate.
@@ -1748,7 +1758,9 @@ output: ./output_ppo
 `epochs` controls complete passes over the training dataset. `ppo_epochs`
 controls optimization passes within each PPO update. Soup forwards both values,
 plus `ppo_kl_penalty`, to the active TRL `PPOConfig` names and prints the
-effective schedule during setup.
+effective schedule during setup. `data.max_length` sets PPO's response length
+(moving the default from TRL's 53 to `data.max_length`), `--deepspeed` is forwarded,
+and `save_total_limit=3` keeps up to 3 checkpoints.
 
 One PPO rollout batch is `batch_size` x `gradient_accumulation_steps` prompts on
 every process, and TRL drops a partial batch, so the train set needs at least
