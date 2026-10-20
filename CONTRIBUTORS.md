@@ -988,6 +988,7 @@ Listed by first contribution. PR numbers link the work.
 
 - **dryn85-max** ([@dryn85-max](https://github.com/dryn85-max))
   - First contribution. Added native DPO on `backend: mlx` with Soup's own training loop (sigmoid loss, reference log-probs precomputed once from the base model, a chunked vocabulary head), reading rows through the same `format: dpo` converter as the transformers backend ([#1846](https://github.com/MakazhanAlpamys/Soup/pull/1846))
+  - Made `backend: mlx` skip a validation split smaller than one batch with a warning, and refuse a training split smaller than one batch before the model loads, instead of crashing at the first evaluation ([#1851](https://github.com/MakazhanAlpamys/Soup/issues/1851), [#1857](https://github.com/MakazhanAlpamys/Soup/pull/1857))
 
 ---
 
