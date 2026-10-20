@@ -162,6 +162,35 @@ training:
 - **Refused at load:** `modality: vision` / `audio` (MLX DPO trains on text and chat rows) and `training.lora.r: 0` (the reference is the untrained LoRA policy, so an adapter must exist), plus `dpo_beta_schedule` / `dpo_ref_regen_epochs` and LoRA+.
 - **Not applied on MLX:** `data.chat_template`, per-row `tools` / `chat_template_kwargs` columns (TRL reads them; MLX DPO renders with the model's own template and nothing else), NEFTune, Liger, FlashAttention and the other CUDA-path options MLX SFT also warns about.
 
+#### DoRA on MLX
+
+For text SFT, set `training.lora.use_dora: true` to use MLX-LM's native
+weight-decomposed adapter instead of plain LoRA. Soup supports dense linear
+targets on unquantized or pre-quantized 4-bit bases, with the same scalar
+`lora.r`, `lora.alpha` and `target_modules` settings as MLX LoRA. The base remains
+frozen; the low-rank factors and magnitude parameters train. Switch/expert layers,
+embedding targets, unmatched target names and 8-bit target layers are refused
+before adapter conversion. `use_rslora`, `rank_pattern` and `alpha_pattern` are
+not supported with MLX DoRA. Unsloth DoRA remains refused.
+
+The output records `fine_tune_type: dora` and is loadable with
+`mlx_lm.load(base, adapter_path=output)`. `soup train --resume auto` warm-starts
+the DoRA weights, including magnitudes; it refuses missing, extra or differently
+shaped adapter tensors before loading any of them. This restores weights only,
+not optimizer state, dataset position or the iteration counter.
+
+To fuse the adapter, use the native MLX-LM command (this is not `soup merge`):
+
+```bash
+mlx_lm.fuse --model ./mlx-base --adapter-path ./output \
+  --save-path ./fused-model --dequantize
+```
+
+Native regression tests use a local, randomly initialized one-layer Llama and
+check training, frozen base weights, gradients, reload and dequantized fusion.
+They require no model downloads. They establish adapter lifecycle correctness;
+they do not establish pretrained-model quality or a speed advantage over LoRA.
+
 #### Optimizers and schedules
 
 `training.optimizer`, `training.scheduler`, `training.warmup_ratio` and
