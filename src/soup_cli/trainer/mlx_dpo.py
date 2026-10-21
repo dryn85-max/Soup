@@ -349,20 +349,11 @@ def _clear_allocator_cache() -> None:
 class MLXDPOTrainerWrapper(MLXSFTTrainerWrapper):
     """DPO on MLX. Reuses MLX SFT's model loading, LoRA attach and warm start."""
 
-    #: The preference loops render rows with the model's own template and warn
-    #: that ``data.chat_template`` is not applied; MLX GRPO applies it.
-    ignores_chat_template = True
-
     def _check_unsupported(self) -> None:
         tcfg = self.config.training
         unsupported = []
         if tcfg.quantization == "8bit":
             unsupported.append("quantization=8bit (use mlx-community 4bit models)")
-        if self.config.data.chat_template and self.ignores_chat_template:
-            unsupported.append(
-                f"data.chat_template (MLX {self.objective} renders with the model's own "
-                "template)"
-            )
         for name, label in (
             ("use_galore", "GaLore"),
             ("use_lorafa", "training.use_lorafa"),

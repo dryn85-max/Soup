@@ -476,7 +476,6 @@ class MLXGRPOTrainerWrapper(MLXDPOTrainerWrapper):
     optimizer plan, clipping, reporting and atomic adapter writer."""
 
     objective = "GRPO"
-    ignores_chat_template = False  # applied, as the transformers path does
 
     def __init__(self, config: Any, **kwargs: Any) -> None:
         for key, flag in (("deepspeed_config", "--deepspeed"), ("fsdp_config", "--fsdp")):

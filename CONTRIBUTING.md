@@ -635,6 +635,17 @@ branch runs every cell. Python 3.13 runs in the nightly and release runs only, n
 on a pull request, so a failure that exists only there shows on `main` in the
 next nightly run.
 
+**Coverage is measured on `main`, not on a pull request.** Every `test (...)`
+cell of a pull-request run, `test (ubuntu-latest, 3.11)` at approval included,
+runs the suite with `--no-cov`: a pull request gets no Codecov report and the
+77% floor is not checked on it. The nightly run on `main` (and a manual dispatch
+or a push to a `release/**` branch) measures coverage in `test (ubuntu-latest,
+3.11)`, checks the floor and uploads the report. So a change that takes coverage
+below 77% merges green and turns the next nightly run red. A plain
+`pytest tests/` measures it and enforces the floor locally (it is in the
+`addopts` of `pyproject.toml`), so run that before you push a change that
+removes tests or adds untested code.
+
 **A draft pull request runs no CI.** Nothing starts while a pull request is a
 draft, whatever is pushed to it. Mark it ready for review and the quick set
 starts on its current head.
