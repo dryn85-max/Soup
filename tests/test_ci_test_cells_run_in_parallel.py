@@ -30,7 +30,8 @@ CONTRIBUTING = ROOT / "CONTRIBUTING.md"
 
 RUN_STEP = "Run unit tests with coverage"
 # 2026-10-19: every cell but ubuntu / 3.11 (3.10 until #1805) runs this one, with
-# `--no-cov`. Coverage is measured in one cell
+# `--no-cov`; 2026-10-21: so does every cell of a pull-request run, ubuntu / 3.11 included.
+# Coverage is measured in one cell of a run that is not a pull request
 # (tests/test_ci_full_matrix_on_approval.py::TestCoverageIsMeasuredInOneCell); the
 # parallelism pins below hold for both steps, because most cells now run the second.
 NO_COV_STEP = "Run unit tests without coverage"

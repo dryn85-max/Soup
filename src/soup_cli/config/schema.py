@@ -5559,7 +5559,7 @@ class SoupConfig(BaseModel):
 
     @model_validator(mode="after")
     def _validate_chat_template_supported_tasks(self) -> "SoupConfig":
-        """Reject chat-template overrides on trainers that never render chat."""
+        """Reject overrides on tasks or backends that never apply them."""
         unsupported = {
             "pretrain",
             "embedding",
@@ -5581,6 +5581,13 @@ class SoupConfig(BaseModel):
             raise ValueError(
                 "data.chat_template is not used by "
                 f"task={self.task!r}; remove it or choose a conversational training task"
+            )
+        # MLX SFT and preference trainers render the model's shipped template only.
+        if self.data.chat_template is not None and self.backend == "mlx":
+            raise ValueError(
+                "data.chat_template is not applied by backend: mlx — the MLX "
+                "trainer renders the model's shipped template only. Remove "
+                "data.chat_template, or use backend: transformers."
             )
         return self
 

@@ -231,11 +231,14 @@ jobs:
   #   starts a second approval run, in a concurrency group of its own so it cannot
   #   cancel the first, and no later push cancels it either. Add other labels
   #   before `ci:full`.
-  # - Coverage uploads from the ubuntu / 3.11 cell only -- the ubuntu cell every
-  #   gated run has and a quick run does not -- so a pull request's Codecov report
-  #   arrives at approval. That cell is also the only one that MEASURES coverage
-  #   (2026-10-19), so the 77% floor is enforced there: a quick run has no such cell
-  #   and does not check it, while the approval run a merge waits for does.
+  # - Coverage is not measured on a pull request at all (2026-10-21). The one cell that
+  #   measures it, enforces the 77% floor and uploads to Codecov is `test (ubuntu-latest,
+  #   3.11)` of a run that is NOT a pull request: the nightly run, a manual dispatch and
+  #   a push to release/**. Every cell of a pull-request run, that cell at approval
+  #   included, runs the suite with `--no-cov`. What it gives up: a pull request has no
+  #   Codecov report, and one that drops coverage below the floor merges green and turns
+  #   the next nightly run red, on `main`. A push to `main` is a quick run, which has no
+  #   ubuntu / 3.11 cell (it never did), so it does not measure either.
   # - A draft pull request runs nothing: `plan` and `lint` are skipped by their
   #   own `if:`, and every other job needs `plan`. The merge gate holds for the
   #   reason above -- the required `test (...)` contexts are never created -- and
@@ -1041,6 +1044,19 @@ jobs:
         # coverage and 85 s with it (CI itself is not measured yet). The two steps carry
         # opposite conditions, so exactly one runs in a cell.
         #
+        # 2026-10-21: and only outside a pull request. The ruling of that day was coverage
+        # "only on push to main and nightly", about 165 job-minutes a day: the approval run
+        # of every pull request ran this step in ubuntu / 3.11 and paid the tracer there.
+        # `github.event_name != 'pull_request'` is on this step and on the upload below,
+        # and the opposite (`== 'pull_request' ||`) on the next one, so a pull request runs
+        # the next step in every cell, ubuntu / 3.11 included, and still writes report.xml.
+        # This step runs for the nightly run, a manual dispatch and a push to release/**.
+        # A push to `main` is QUICK (ubuntu / 3.12 only) and has no ubuntu / 3.11 cell, so it
+        # runs the next step as before: it never measured coverage, and the ruling's "a drop
+        # shows on the merge commit" would need the quick cell to measure it, which costs the
+        # tracer on every push to main (see tests/test_ci_full_matrix_on_approval.py,
+        # TestCoverageIsMeasuredInOneCell).
+        #
         # 2026-10-20: a hung test is capped three ways. `--timeout=600 --timeout-method=thread`
         # (pytest-timeout, in the dev extra) fails ONE test that has run for ten minutes: the
         # thread method works on Windows (no SIGALRM there) and in an xdist worker, which it
@@ -1066,24 +1082,27 @@ jobs:
         # two finished tests of one worker, an upper bound), and the longest test step of the
         # last 7 days took 27.7 minutes, so none of the caps can fire on a healthy run. A test
         # that needs longer marks itself `@pytest.mark.timeout(N)`.
-        if: env.RUN_SUITE == 'true' && matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11'
+        if: env.RUN_SUITE == 'true' && github.event_name != 'pull_request' && matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11'
         timeout-minutes: 45
         run: pytest tests/ -n logical --dist loadfile -v --tb=short -o faulthandler_timeout=300 --timeout=600 --timeout-method=thread --max-worker-restart=2 --junitxml=report.xml --cov=soup_cli --cov-report=xml:coverage.xml --cov-report=term-missing:skip-covered
       - name: Run unit tests without coverage
         # Same options as the step above minus the coverage reports; `--junitxml` stays in
         # both, because the nightly test-count badge reads report.xml from ubuntu / 3.11,
-        # which runs the step above since #1805 and ran this one before: with it in both,
-        # moving the badge or the coverage cell cannot leave the badge without a report.
-        # The same two caps.
-        if: env.RUN_SUITE == 'true' && (matrix.os != 'ubuntu-latest' || matrix.python-version != '3.11')
+        # which runs the step above (it is a schedule run, never a pull request) and ran
+        # this one before #1805: with it in both, moving the badge or the coverage cell
+        # cannot leave the badge without a report, and a pull request still writes one.
+        # The exact opposite of the step above: every cell of a pull request, and every cell
+        # of any run but ubuntu / 3.11. The same two caps.
+        if: env.RUN_SUITE == 'true' && (github.event_name == 'pull_request' || matrix.os != 'ubuntu-latest' || matrix.python-version != '3.11')
         timeout-minutes: 45
         run: pytest tests/ -n logical --dist loadfile -v --tb=short -o faulthandler_timeout=300 --timeout=600 --timeout-method=thread --max-worker-restart=2 --junitxml=report.xml --no-cov
       - name: Upload coverage to Codecov
-        # ubuntu / 3.11 is the ubuntu cell every gated run has (release, full,
-        # approval) and a quick run does not: the oldest supported Python. It was 3.11
+        # The cell that measures coverage, nowhere else: ubuntu / 3.11 of a run that is not a
+        # pull request (release, nightly, manual dispatch), the same condition as "Run unit
+        # tests with coverage" -- a pull request has no coverage.xml to send. It was 3.11
         # until the approval run of 2026-10-07 stopped having that cell, 3.10 from then
         # on, and 3.11 again since #1805 made it the oldest.
-        if: env.RUN_SUITE == 'true' && matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11'
+        if: env.RUN_SUITE == 'true' && github.event_name != 'pull_request' && matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11'
         uses: codecov/codecov-action@v4
         with:
           files: coverage.xml
