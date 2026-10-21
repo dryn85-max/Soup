@@ -445,7 +445,7 @@ class TestTheTestCellsSkipOnlyInADocsOnlyRun:
         ]
         assert sorted(f"{cell['os']} {cell['python-version']}" for cell in idle) == [
             "macos-latest 3.12",
-            "ubuntu-latest 3.10",
+            "ubuntu-latest 3.11",
             "windows-latest 3.12",
         ]
 
@@ -463,7 +463,7 @@ class TestTheTestCellsSkipOnlyInADocsOnlyRun:
 
     def test_the_coverage_cell_and_the_badge_step_never_run_in_a_docs_only_run(self) -> None:
         """No coverage report exists to upload when the cell that measures it did nothing."""
-        coverage_cell = {"os": "ubuntu-latest", "python-version": "3.10"}
+        coverage_cell = {"os": "ubuntu-latest", "python-version": "3.11"}
         assert "Upload coverage to Codecov" not in _steps_that_run(coverage_cell, "true")
         assert "Upload coverage to Codecov" in _steps_that_run(coverage_cell, "false")
 
