@@ -247,6 +247,14 @@ reward, and takes one policy-gradient step. This is the objective both backends
 train today: the effective `GRPOConfig` of Soup's transformers path on TRL
 0.29.1, whose defaults Soup does not override.
 
+Qualified on Qwen2.5-0.5B-Instruct in bf16 on an M4 Pro, on 400 synthetic
+arithmetic prompts (`a * b ± c`, gold in `\boxed{}`) with `reward_fn: accuracy`,
+`num_generations: 4`, batch 4 × accumulation 2, `grpo_beta: 0.1`: 200 updates
+took about 10 minutes and 6.0 GB, and greedy accuracy on 100 held-out prompts
+went from 0.04 to 0.99 as the model learned to work the product out before
+answering. That task is easy and fully verifiable; it shows the loop training,
+not reasoning quality in general.
+
 | setting | value |
 |---|---|
 | `loss_type` | `dapo`: per-token clipped surrogate, summed over every completion token of the update and divided by that token count (EOS included) |
