@@ -244,6 +244,8 @@ def score_completions(reward_fn: Callable, rows: list, texts: list, completion_i
     ``rows[k]`` is the prompt row of completions ``k*group .. k*group+group-1``;
     every column but the prompt is repeated per completion (TRL's
     ``reward_kwargs``), so each completion is scored against its own gold.
+    TRL also passes ``trainer_state``; there is no HF trainer state here and
+    the built-in rewards do not read it, so it is not passed.
     """
     keys = [k for k in dict.fromkeys(k for row in rows for k in row)
             if k not in ("prompt", "completion", "completion_ids")]
@@ -436,8 +438,16 @@ def adapter_disabled(model: Any) -> Iterator[int]:
     try:
         for m in modules:
             m.scale = 0.0
-        if any(m.scale != 0.0 for m in _lora_modules(model)):
-            raise RuntimeError("MLX GRPO: a LoRA module kept its scale")
+        # Counted independently of the kinds above: every module that carries
+        # an adapter (``lora_a``) and a ``scale``. A kind this tuple misses
+        # (DoRA, a new mlx-lm layer) would keep its update in the reference.
+        adapters = [m for _, m in model.named_modules()
+                    if hasattr(m, "lora_a") and hasattr(m, "scale")]
+        if len(adapters) != len(modules) or any(m.scale != 0.0 for m in adapters):
+            raise RuntimeError(
+                f"MLX GRPO: {len(adapters)} adapter module(s) found but {len(modules)} "
+                "switched off; the reference would not be the base model"
+            )
         yield len(modules)
     finally:
         for m, scale in zip(modules, saved):
@@ -504,10 +514,11 @@ class MLXGRPOTrainerWrapper(MLXDPOTrainerWrapper):
             num_generations=int(tcfg.num_generations),
         )
         if units.bumped:
+            given = "auto (1 on MLX)" if not isinstance(tcfg.batch_size, int) else batch_size
             console.print(
-                f"[dim]MLX GRPO: training.batch_size {batch_size} is below num_generations; "
-                f"using {units.completions_per_step} completions per micro-step, as the "
-                "transformers path does[/]"
+                f"[dim]MLX GRPO: training.batch_size {given} is below num_generations="
+                f"{units.num_generations}; using one group, {units.completions_per_step} "
+                "completions per micro-step, as the transformers path does[/]"
             )
         # Refuses a split smaller than one update now rather than after the load.
         plan_prompt_updates(n_prompts=len(train), prompts_per_update=units.prompts_per_update,
@@ -538,9 +549,12 @@ class MLXGRPOTrainerWrapper(MLXDPOTrainerWrapper):
     def _check_dense(self, model: Any) -> None:
         import mlx.nn as nn
 
+        # Any quantized kind: nn.QuantizedLinear / QuantizedEmbedding, mlx-lm's
+        # QuantizedSwitchLinear, or anything else that stores quantization scales.
         quantized = [
             name for name, module in model.named_modules()
             if isinstance(module, (nn.QuantizedLinear, nn.QuantizedEmbedding))
+            or "scales" in module
         ]
         if quantized:
             raise ValueError(
@@ -720,6 +734,14 @@ class MLXGRPOTrainerWrapper(MLXDPOTrainerWrapper):
         train_ids = [self._render(hf, r["prompt"], "train", i) for i, r in enumerate(train_rows)]
         val_ids = [self._render(hf, r["prompt"], "validation", i) for i, r in enumerate(val_rows)]
         self._check_context(train_ids + val_ids, max_new)
+        if val_rows:
+            console.print(
+                f"[yellow]MLX GRPO: {len(val_rows)} prompt(s) are held out for validation "
+                f"(data.val_split={cfg.data.val_split}; on backend: mlx the loader always "
+                "holds the split out) and are scored once after training, not trained on. "
+                "Set data.val_split: 0 to train on every prompt, as transformers GRPO does "
+                "without training.eval_steps.[/]"
+            )
         plan = plan_prompt_updates(n_prompts=len(train_rows),
                                    prompts_per_update=units.prompts_per_update,
                                    epochs=int(tcfg.epochs), seed=seed)

@@ -268,12 +268,14 @@ task: grpo
 backend: mlx
 
 data:
-  train: ./math.jsonl        # prompt + answer, or messages ending in the answer
+  train: ./math.jsonl        # chatml rows; the final assistant turn is the gold answer
+  format: chatml
   max_length: 256            # = max_completion_length; keep it small
 
 training:
   reward_fn: accuracy        # or format
   num_generations: 4
+  # batch_size: auto (or anything below num_generations) is one group
   batch_size: 4              # completions per micro-step, as in TRL
   gradient_accumulation_steps: 2
   grpo_beta: 0.1
@@ -284,11 +286,17 @@ training:
     alpha: 32
 ```
 
+A row of `math.jsonl`:
+`{"messages": [{"role": "user", "content": "What is 2+3? End with '#### <number>'."}, {"role": "assistant", "content": "#### 5"}]}`.
+The loader does not auto-detect bare `{"prompt", "answer"}` rows; use `messages`
+(or Alpaca `instruction` / `output`).
+
 - **Units are TRL's.** `training.batch_size` counts completions per
   micro-step. One update uses `batch_size x gradient_accumulation_steps`
-  completions, which is that number divided by `num_generations` prompts. The product must be a multiple
-  of `num_generations`. A batch smaller than one group is raised to
-  `num_generations`, as on the transformers path. Prompts are shuffled each
+  completions, which is that number divided by `num_generations` prompts. The
+  product must be a multiple of `num_generations`. A batch smaller than one
+  group is raised to `num_generations`, as on the transformers path;
+  `batch_size: auto` is one group on MLX (`num_generations` completions). Prompts are shuffled each
   epoch from `training.seed`. The trailing prompts that do not fill an update
   are dropped, as TRL's sampler does, so there are `prompts // prompts per
   update` updates per epoch. `data_seed` does not change the order on either
@@ -299,13 +307,14 @@ training:
   prefilled once and sampled through mlx-lm's KV cache. A completion stops at
   the tokenizer's `eos_token_id`, which it keeps, or at `data.max_length`
   tokens. A prompt plus `data.max_length` longer than the model's context is
-  refused.
+  refused; the transformers path has no such check.
 - **Prompts and rewards.** Prompts are read as on the transformers path. A
   `prompt` string is the user turn. With `messages`, a final assistant turn
   becomes the gold `answer`. Alpaca `instruction` / `output` rows work too. The
   chat template is applied with `add_generation_prompt`, including
   `data.chat_template` and the transformers path's fallback template.
-  `accuracy` and `format` are called with TRL's arguments. Each completion is
+  `accuracy` and `format` are called with TRL's arguments except
+  `trainer_state`, which the built-in rewards do not read. Each completion is
   scored against its own row's gold, with every other column passed through.
   A missing or unreadable gold, or too few prompts for one update, is refused
   before the model loads. A reward that is not a finite number for each
@@ -320,12 +329,15 @@ training:
   drives both the schedule and Adam's bias correction, so a skipped update
   also holds the learning-rate schedule. The transformers path still advances
   its scheduler.
-- **Validation.** When the run has a validation split (`data.val_split`,
-  default 0.1), its prompts are scored once after training. The same sampling
-  is used, seeded, with no parameter change. The result is reported as
-  `val_reward`. The transformers path evaluates only with
-  `training.eval_steps`, which MLX GRPO refuses. Set `data.val_split: 0` to
-  skip it.
+- **Validation.** On `backend: mlx` the loader always holds out
+  `data.val_split` (default 0.1) of the rows, while transformers GRPO holds
+  rows out only when `training.eval_steps` is set. The run prints how many
+  prompts were held out at the start. Those prompts are not trained on; they
+  are scored once after training, `num_generations` completions each, at
+  temperature 1 in eval mode (LoRA dropout off), seeded from `training.seed`,
+  with no parameter change, and reported as `val_reward`. MLX GRPO refuses
+  `training.eval_steps`. Set `data.val_split: 0` to train on every row, as the
+  transformers path does without `eval_steps`.
 - **Reported per update:** loss, reward mean and sample std, per-reward mean
   and std, the fraction of groups with zero reward std, completion mean, min
   and max length, the truncated (no-EOS) fraction, KL (when `beta > 0`), clip
@@ -339,7 +351,8 @@ training:
 - **Cost.** Rollouts dominate: each update samples up to `data.max_length`
   tokens for `num_generations` completions of every prompt. Keep
   `data.max_length` small. With `grpo_beta > 0` each micro-step adds one
-  reference forward.
+  reference forward. Validation adds up to `num_generations x data.max_length`
+  sampled tokens per held-out prompt, one prompt after another.
 - **Refused at load:** `quantization: 8bit`, `training.lora.r: 0`, DoRA,
   LoRA+, LoRA-FA, non-text `modality`, a `.py`, comma-ensemble or
   `verifiable` reward, `prm_reward`, `rollout_backend` / `rollout_func`,

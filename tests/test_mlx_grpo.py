@@ -1331,14 +1331,10 @@ output: ./output
         ("curriculum: true", "training.curriculum is not applied"),
         ("grpo_variant: gspo", "grpo_variant is not supported on backend=mlx"),
         ("prm_reward: ./prm", "prm_reward requires backend='transformers'"),
-        ("rollout_backend: openenv", "rollout_backend is not supported on backend=mlx"),
         ("vllm_sleep_mode: true", "vllm_sleep_mode requires backend"),
-        ("tis_threshold: 2.0", "GRPO stability fields ['tis_threshold']"),
-        ("skip_zero_advantage: true", "GRPO stability fields ['skip_zero_advantage']"),
         ("use_lorafa: true", "use_lorafa requires backend='transformers'"),
         ("loraplus_lr_ratio: 16", "loraplus_lr_ratio is not implemented on backend='mlx'"),
         ("relora_steps: 10", "relora_steps is not supported on the mlx backend"),
-        ("long_context_grpo: true", "long_context_grpo is not supported on backend=mlx"),
         ("stream_layers: true", "stream_layers cannot be used with task='grpo'"),
     ])
     def test_each_unsupported_setting_is_refused_at_load(self, line, match):
@@ -1346,6 +1342,50 @@ output: ./output
         with pytest.raises(Exception, match=match.replace("[", r"\[").replace("]", r"\]")
                            .replace("(", r"\(").replace(")", r"\)").replace(".", r"\.")):
             _config(**{key: value})
+
+    @pytest.mark.parametrize("line", [
+        "tis_threshold: 2.0", "skip_zero_advantage: true", "off_policy_mask_threshold: 0.5",
+        "grpo_fp16: true", "async_grpo_prefetch: true", "ref_model_ema_alpha: 0.9",
+        "replay_buffer_size: 8", "defer_rerolling: true", "rollout_backend: openenv",
+        "long_context_grpo: true",
+    ])
+    def test_older_gates_defer_to_the_mlx_grpo_refusal_with_its_remedy(self, line):
+        """The v0.50.0 gates used to answer first, with no remedy (review of #1976)."""
+        key, value = line.split(": ", 1)
+        with pytest.raises(Exception) as info:
+            _config(**{key: value})
+        message = " ".join(str(info.value).split())
+        assert f"training.{key} is not applied by task='grpo' on backend='mlx'" in message
+        assert f"Remove training.{key}, or use backend: transformers." in message
+        assert "v0.50.0" not in message
+
+    @pytest.mark.parametrize("key", ["tis_threshold", "skip_zero_advantage",
+                                     "off_policy_mask_threshold", "mask_truncated_completions"])
+    def test_record_only_fields_say_the_transformers_path_only_records_them(self, key):
+        from soup_cli.config.schema import _MLX_GRPO_UNAPPLIED
+
+        assert _MLX_GRPO_UNAPPLIED[key].startswith("the transformers path only")
+
+    def test_the_older_gates_are_unchanged_elsewhere(self):
+        from soup_cli.config.loader import load_config_from_string
+
+        transformers = _GRPO_YAML.replace("backend: mlx", "backend: transformers")
+        cfg = load_config_from_string(transformers.replace(
+            "  quantization: none\n", "  quantization: none\n  tis_threshold: 2.0\n"))
+        assert cfg.training.tis_threshold == 2.0
+        dpo = _GRPO_YAML.replace("task: grpo", "task: dpo").replace(
+            "  reward_fn: format\n", "")
+        for extra, match in [("  tis_threshold: 2.0\n", "require task='grpo'"),
+                             ("  rollout_backend: openenv\n", "requires task='grpo'"),
+                             ("  long_context_grpo: true\n", "grpo")]:
+            with pytest.raises(Exception, match=match):
+                load_config_from_string(dpo.replace("  quantization: none\n",
+                                                    "  quantization: none\n" + extra))
+        from soup_cli.utils.grpo_long_context import validate_long_context_grpo_compat
+
+        with pytest.raises(ValueError, match="mlx"):
+            validate_long_context_grpo_compat(task="grpo", backend="mlx",
+                                              use_ring_attention=False)
 
     def test_reward_verifiable_is_refused(self):
         with pytest.raises(Exception, match="reward_fn='verifiable' is not supported"):
@@ -1402,3 +1442,223 @@ output: ./output
         with pytest.raises(typer.Exit):
             _resolve_resume_or_exit("auto", _config())
         assert "#1977" in capsys.readouterr().out
+
+
+# --------------------------------------------------------------------------
+# Review of #1976: config values reach the loop; coverage checks
+# --------------------------------------------------------------------------
+
+
+class TestConfigValuesReachTheLoop:
+    def test_num_generations_beta_and_the_completion_cap(self, tmp_path, monkeypatch):
+        """num_generations=3, grpo_beta=0.3 and data.max_length=70 are the values the
+        loop runs with: whole groups of 3, completions capped at 70, and a loss
+        that matches the oracle at beta 0.3 once the policy has moved off the base."""
+        mx = pytest.importorskip("mlx.core")
+        from soup_cli.trainer import mlx_grpo
+
+        rollouts, calls = [], []
+        real_rollout = mlx_grpo.MLXGRPOTrainerWrapper._rollout
+        real_loss = mlx_grpo.grpo_token_loss
+
+        def rollout(self, hf, prompt_ids, eos, max_new):
+            out = real_rollout(self, hf, prompt_ids, eos, max_new)
+            rollouts.append((len(prompt_ids), out[0], out[1]))
+            return out
+
+        def loss(logps, advantages, mask, **kwargs):
+            value, sums = real_loss(logps, advantages, mask, **kwargs)
+            calls.append({"logps": mx.stop_gradient(logps), "adv": advantages, "mask": mask,
+                          "ref": kwargs["ref_logps"], "num_items": kwargs["num_items"],
+                          "loss": mx.stop_gradient(value), "kl": mx.stop_gradient(sums["kl"])})
+            return value, sums
+
+        monkeypatch.setattr(mlx_grpo.MLXGRPOTrainerWrapper, "_rollout", rollout)
+        monkeypatch.setattr(mlx_grpo, "grpo_token_loss", loss)
+        from soup_cli.config.loader import load_config_from_string
+
+        text = (_GRPO_YAML.replace("  max_length: 64\n", "  max_length: 70\n")
+                .replace("  num_generations: 4\n", "  num_generations: 3\n")
+                .replace("  grpo_beta: 0.1\n", "  grpo_beta: 0.3\n")
+                .replace("  batch_size: 4\n", "  batch_size: 3\n")
+                .replace("  gradient_accumulation_steps: 1\n",
+                         "  gradient_accumulation_steps: 2\n")
+                .replace("  lr: 0.05\n", "  lr: 0.2\n"))
+        wrapper = _wrapper(tmp_path, monkeypatch)
+        wrapper.config = load_config_from_string(text)
+        result = wrapper.train()
+
+        assert len(rollouts) == 4 and len(calls) == 8  # 8 prompts / 2 per update
+        truncated = 0
+        for n_prompts, completions, terminated in rollouts:
+            assert n_prompts == 2 and len(completions) == 2 * 3
+            for tokens, done in zip(completions, terminated):
+                assert len(tokens) <= 70
+                if done:
+                    assert tokens[-1] == EOS and EOS not in tokens[:-1]
+                else:
+                    assert len(tokens) == 70
+                    truncated += 1
+        assert truncated > 0, "fixture must reach the cap"
+        last = rollouts[-1]
+        assert result["completions/max_length"] <= 70
+        assert result["completions/clipped_ratio"] == pytest.approx(
+            last[2].count(False) / len(last[2]))
+        meta = json.loads((tmp_path / "output" / "adapter_config.json").read_text())
+        assert (meta["num_generations"], meta["beta"], meta["max_completion_length"]) == (
+            3, 0.3, 70)
+
+        moved = 0
+        for call in calls:
+            logps, mask = np.array(call["logps"]), np.array(call["mask"], dtype=np.float64)
+            ref, adv = np.array(call["ref"]), np.array(call["adv"])
+            expected = _np_loss(logps, logps, ref, adv, mask, beta=0.3,
+                                num_items=call["num_items"])
+            assert call["loss"].item() == pytest.approx(expected, rel=1e-4, abs=1e-6)
+            d = ref - logps
+            kl = ((np.exp(d) - d - 1) * mask).sum()
+            assert call["kl"].item() == pytest.approx(kl, rel=1e-3, abs=1e-7)
+            moved += kl > 1e-4
+        assert moved >= 2, "the policy must move off the reference for beta to matter"
+
+
+class TestHeldOutPrompts:
+    def test_the_hold_out_is_announced_with_its_remedy(self, tmp_path, monkeypatch):
+        from io import StringIO
+
+        from rich.console import Console
+
+        from soup_cli.trainer import mlx_grpo
+
+        buffer = StringIO()
+        monkeypatch.setattr(mlx_grpo, "console", Console(file=buffer, width=400))
+        _wrapper(tmp_path, monkeypatch, val=_prompt_rows(3, prefix="v")).train()
+        text = " ".join(buffer.getvalue().split())
+        assert ("MLX GRPO: 3 prompt(s) are held out for validation (data.val_split=0.1; "
+                "on backend: mlx the loader always holds the split out)") in text
+        assert ("Set data.val_split: 0 to train on every prompt, as transformers GRPO does "
+                "without training.eval_steps.") in text
+
+    def test_nothing_is_announced_without_a_validation_split(self, tmp_path, monkeypatch):
+        from io import StringIO
+
+        from rich.console import Console
+
+        from soup_cli.trainer import mlx_grpo
+
+        buffer = StringIO()
+        monkeypatch.setattr(mlx_grpo, "console", Console(file=buffer, width=400))
+        _wrapper(tmp_path, monkeypatch, train=_prompt_rows(1)).train()
+        assert "held out" not in buffer.getvalue()
+
+    def test_batch_size_auto_names_the_group(self, monkeypatch):
+        from io import StringIO
+
+        from rich.console import Console
+
+        from soup_cli.trainer import mlx_grpo
+
+        buffer = StringIO()
+        monkeypatch.setattr(mlx_grpo, "console", Console(file=buffer, width=400))
+        _setup_wrapper(monkeypatch, batch_size="auto")._prepare({"train": _prompt_rows(2)})
+        assert ("training.batch_size auto (1 on MLX) is below num_generations=4; using one "
+                "group, 4 completions per micro-step") in buffer.getvalue()
+
+
+class TestAdapterCoverage:
+    def _base_then_lora(self, model, keys):
+        mx = pytest.importorskip("mlx.core")
+        from mlx_lm.tuner.utils import linear_to_lora_layers
+
+        x = mx.array([[3, 4, 5, 6]])
+        base = np.array(model(x))
+        model.freeze()
+        linear_to_lora_layers(model, len(model.layers),
+                              {"rank": 4, "scale": 2.0, "dropout": 0.0, "keys": keys})
+        for _, m in model.named_modules():
+            if hasattr(m, "lora_b"):
+                m.lora_b = mx.random.normal(m.lora_b.shape)
+        return x, base
+
+    def test_an_embedding_adapter_is_switched_off(self):
+        pytest.importorskip("mlx_lm")
+        from mlx_lm.models import llama
+
+        from soup_cli.trainer.mlx_grpo import adapter_disabled
+
+        model = llama.Model(llama.ModelArgs(
+            model_type="llama", hidden_size=32, num_hidden_layers=2, intermediate_size=64,
+            num_attention_heads=4, num_key_value_heads=2, rms_norm_eps=1e-5, vocab_size=40,
+            tie_word_embeddings=False))
+        x, base = self._base_then_lora(model, {"model.embed_tokens", "self_attn.q_proj"})
+        kinds = {type(m).__name__ for _, m in model.named_modules() if hasattr(m, "lora_a")}
+        assert kinds == {"LoRAEmbedding", "LoRALinear"}
+        assert np.abs(np.array(model(x)) - base).max() > 1e-3
+        with adapter_disabled(model) as count:
+            np.testing.assert_array_equal(np.array(model(x)), base)
+        assert count == 3
+        assert np.abs(np.array(model(x)) - base).max() > 1e-3
+
+    def test_a_switch_adapter_is_switched_off(self):
+        pytest.importorskip("mlx_lm")
+        from mlx_lm.models import mixtral
+
+        from soup_cli.trainer.mlx_grpo import adapter_disabled
+
+        model = mixtral.Model(mixtral.ModelArgs(
+            model_type="mixtral", vocab_size=40, hidden_size=32, intermediate_size=64,
+            num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=2,
+            num_local_experts=4, num_experts_per_tok=2, rms_norm_eps=1e-5))
+        x, base = self._base_then_lora(model, {"block_sparse_moe.switch_mlp.gate_proj"})
+        with adapter_disabled(model) as count:
+            np.testing.assert_array_equal(np.array(model(x)), base)
+        assert count == 2
+
+    def test_an_adapter_kind_the_switch_misses_is_refused(self):
+        mx = pytest.importorskip("mlx.core")
+        nn = pytest.importorskip("mlx.nn")
+        from soup_cli.trainer.mlx_grpo import _lora_modules, adapter_disabled
+
+        model = _attach_lora(_tiny_llama())
+
+        class Unknown(nn.Module):  # e.g. DoRA, or a future mlx-lm adapter layer
+            def __init__(self):
+                super().__init__()
+                self.lora_a = mx.zeros((2, 2))
+                self.scale = 2.0
+
+        model.extra = Unknown()
+        before = [m.scale for m in _lora_modules(model)]
+        with pytest.raises(RuntimeError, match="the reference would not be the base model"):
+            with adapter_disabled(model):
+                pass
+        assert [m.scale for m in _lora_modules(model)] == before and model.extra.scale == 2.0
+
+
+class TestDenseCheck:
+    def test_a_quantized_switch_layer_is_refused(self, tmp_path, monkeypatch):
+        pytest.importorskip("mlx.core")
+        pytest.importorskip("mlx.nn")
+        pytest.importorskip("mlx_lm")
+        from mlx_lm.models.switch_layers import QuantizedSwitchLinear
+
+        wrapper = _wrapper(tmp_path, monkeypatch)
+        wrapper.model.experts = QuantizedSwitchLinear(64, 64, 2, group_size=32)
+        with pytest.raises(ValueError, match="first: experts"):
+            wrapper._check_dense(wrapper.model)
+
+    def test_any_module_storing_quantization_scales_is_refused(self, tmp_path, monkeypatch):
+        mx = pytest.importorskip("mlx.core")
+        nn = pytest.importorskip("mlx.nn")
+
+        class Stub(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.scales = mx.ones((1,))
+
+        wrapper = _wrapper(tmp_path, monkeypatch)
+        wrapper.model.odd = Stub()
+        with pytest.raises(ValueError, match="first: odd"):
+            wrapper._check_dense(wrapper.model)
+        del wrapper.model["odd"]
+        wrapper._check_dense(wrapper.model)

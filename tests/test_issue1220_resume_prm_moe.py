@@ -17,6 +17,7 @@ from __future__ import annotations
 import ast
 import json
 import re
+import textwrap
 from pathlib import Path
 
 from typer.testing import CliRunner
@@ -80,6 +81,11 @@ def _forwards_resume(func: ast.FunctionDef) -> bool:
             ):
                 return True  # ppo.py's self._train_builtin(...), mlx_sft's weight loader
     return False
+
+
+#: Wrappers allowed to refuse ``--resume`` inside ``train()``: a task refused on
+#: one backend only. Keep this list explicit; a new entry needs a reason.
+_BODY_REFUSAL_ALLOWED = frozenset({"mlx_grpo.py"})  # #1977: MLX saves the adapter only
 
 
 def _refuses_resume(func: ast.FunctionDef) -> bool:
@@ -181,7 +187,10 @@ class TestTrainerScanInvariants:
                         if is_refused:
                             continue
 
-                        if not _forwards_resume(item) and not _refuses_resume(item):
+                        # Only MLX GRPO may refuse in its body (#1977): every other
+                        # wrapper must forward the checkpoint or be task-refused.
+                        refuses = file_name in _BODY_REFUSAL_ALLOWED and _refuses_resume(item)
+                        if not _forwards_resume(item) and not refuses:
                             failures.append(
                                 f"{file_name}::{node.name}.train() accepts resume_from_checkpoint "
                                 f"but does not forward it and task {task_name!r} is not in "
@@ -469,3 +478,15 @@ def test_save_mole_gate_writes_fp32_from_a_16_bit_gate(tmp_path):
     saved = torch.load(tmp_path / "mole_gate.pt", map_location="cpu", weights_only=True)
     assert saved["weight"].dtype == torch.float32, saved["weight"].dtype
     assert torch.equal(saved["weight"], gate.weight.detach().float())
+
+
+def test_only_the_listed_wrapper_may_refuse_resume_in_its_body():
+    """The explicit-raise acceptance is not a general escape hatch."""
+    tree = ast.parse(textwrap.dedent("""
+        def train(self, resume_from_checkpoint=None):
+            if resume_from_checkpoint is not None:
+                raise ValueError("no")
+    """))
+    func = tree.body[0]
+    assert _refuses_resume(func) and not _forwards_resume(func)
+    assert _BODY_REFUSAL_ALLOWED == {"mlx_grpo.py"}

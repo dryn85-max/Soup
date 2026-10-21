@@ -4960,6 +4960,8 @@ _MLX_GRPO_UNAPPLIED: dict[str, str] = {
     "prm_aggregate": "process reward models (training.prm_reward) are not scored on MLX",
     "vllm_sleep_mode": f"{_MLX_GRPO_NOT_GENERATED_HERE}, not vLLM",
     "async_grpo_prefetch": f"{_MLX_GRPO_NOT_GENERATED_HERE}, one rollout per update",
+    "replay_buffer_size": "MLX GRPO trains each rollout once and keeps no replay buffer",
+    "defer_rerolling": f"{_MLX_GRPO_NOT_GENERATED_HERE}, one rollout per update",
     "grpo_fp16": "the MLX loop has no fp16 GRPO mode",
     "grpo_delta": "two-sided clipping is not part of the objective MLX trains",
     "long_context_grpo": "long-context GRPO runs on the transformers path only",
@@ -4967,10 +4969,19 @@ _MLX_GRPO_UNAPPLIED: dict[str, str] = {
     "ref_model_ema_alpha": "the MLX reference is the frozen base model",
     "quantize_ref_model": "the MLX reference is the base model with the adapter off",
     "quantize_reward_model": "MLX GRPO scores with the built-in rewards only",
-    "tis_threshold": "MLX GRPO generates on-policy and applies no importance correction",
-    "off_policy_mask_threshold": "MLX GRPO generates on-policy and applies no off-policy mask",
-    "mask_truncated_completions": "truncated completions are trained, as TRL's default does",
-    "skip_zero_advantage": "zero-advantage groups are trained, as TRL's default does",
+    # These four never reach TRL's GRPOConfig on the transformers path either:
+    # Soup's GRPOStabilityCallback only records them (tis_threshold also logs a
+    # warning past the threshold; monitoring/grpo_stability_callback.py). MLX
+    # has no such callback, so they are refused rather than silently dropped.
+    "tis_threshold": "the transformers path only logs it (its stability callback warns "
+    "past the threshold); MLX GRPO generates on-policy and applies no importance "
+    "correction",
+    "off_policy_mask_threshold": "the transformers path only records it (its stability "
+    "callback); MLX GRPO applies no off-policy mask",
+    "mask_truncated_completions": "the transformers path only records it (its stability "
+    "callback); truncated completions train, as TRL's default does",
+    "skip_zero_advantage": "the transformers path only records it (its stability "
+    "callback); zero-advantage groups train, as TRL's default does",
     "eval_steps": "MLX GRPO scores the validation split once, after training "
     "(val_reward), with no mid-run evaluation",
     "use_lorafa": "LoRA-FA has no MLX implementation",
@@ -5913,6 +5924,8 @@ class SoupConfig(BaseModel):
         """
         if not self.training.long_context_grpo:
             return self
+        if self.backend == "mlx" and self.task == "grpo":
+            return self  # #1976: _refuse_mlx_grpo_scope gives the MLX GRPO refusal
         from soup_cli.utils.grpo_long_context import (
             validate_long_context_grpo_compat,
         )
@@ -6002,10 +6015,9 @@ class SoupConfig(BaseModel):
                 f"got task={self.task!r}"
             )
         if self.backend == "mlx":
-            raise ValueError(
-                f"GRPO stability fields {active} are not supported on "
-                "backend=mlx in v0.50.0"
-            )
+            # #1976: task='grpo' here, and _refuse_mlx_grpo_scope names each
+            # field with the reason and a remedy.
+            return self
         return self
 
     @model_validator(mode="after")
@@ -7300,9 +7312,7 @@ class SoupConfig(BaseModel):
                 f"rollout_backend requires task='grpo'; got task={self.task!r}"
             )
         if self.backend == "mlx":
-            raise ValueError(
-                "rollout_backend is not supported on backend=mlx in v0.50.0"
-            )
+            return self  # #1976: _refuse_mlx_grpo_scope gives the MLX GRPO refusal
         if (
             self.training.rollout_backend == "openenv"
             and self.training.rollout_func is None
