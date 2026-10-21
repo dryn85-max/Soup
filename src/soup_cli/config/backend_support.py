@@ -232,16 +232,7 @@ _MLX_DPO: tuple[SupportEntry, ...] = tuple(
 _MLX_ORPO: tuple[SupportEntry, ...] = _MLX_DPO
 
 #: MLX KTO runs MLX DPO's loop and reference precompute: the same fields.
-_MLX_KTO: tuple[SupportEntry, ...] = tuple(
-    entry for entry in _MLX_DPO if entry.field != "data.chat_template"
-) + (
-    SupportEntry(
-        "data.chat_template",
-        IGNORED,
-        "MLX KTO renders conversational rows with the model's own chat template",
-        trainer_reads=True,
-    ),
-)
+_MLX_KTO: tuple[SupportEntry, ...] = _MLX_DPO
 
 
 #: ``(task, backend, modality)`` -> the settings that combination does not honour.
