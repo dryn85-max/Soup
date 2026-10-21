@@ -82,6 +82,26 @@ def _forwards_resume(func: ast.FunctionDef) -> bool:
     return False
 
 
+def _refuses_resume(func: ast.FunctionDef) -> bool:
+    """The body tests ``resume_from_checkpoint`` and raises: an explicit refusal.
+
+    For a task refused on one backend only (MLX GRPO, #1977), where
+    ``UNSUPPORTED_RESUME_TASKS`` would also refuse the other backend's resume.
+    """
+    for stmt in func.body:
+        for node in ast.walk(stmt):
+            if not isinstance(node, ast.If):
+                continue
+            tests_it = any(
+                isinstance(n, ast.Name) and n.id == "resume_from_checkpoint"
+                for n in ast.walk(node.test)
+            )
+            if tests_it and any(isinstance(n, ast.Raise) for b in node.body
+                                for n in ast.walk(b)):
+                return True
+    return False
+
+
 class TestTrainerScanInvariants:
     """Static AST verification that every trainer wrapper handles resume_from_checkpoint."""
 
@@ -161,7 +181,7 @@ class TestTrainerScanInvariants:
                         if is_refused:
                             continue
 
-                        if not _forwards_resume(item):
+                        if not _forwards_resume(item) and not _refuses_resume(item):
                             failures.append(
                                 f"{file_name}::{node.name}.train() accepts resume_from_checkpoint "
                                 f"but does not forward it and task {task_name!r} is not in "

@@ -30,15 +30,23 @@ from __future__ import annotations
 import math
 import random
 import statistics
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable, Iterator, Optional
 
 from rich.console import Console
 
+from soup_cli.trainer.loss_summary import summarize_training_loss
 from soup_cli.trainer.mlx_dpo import (
     DEFAULT_LOGIT_CHUNK,
+    MLXDPOTrainerWrapper,
+    _as_ids,
+    _clear_allocator_cache,
+    resolve_head_split,
 )
+from soup_cli.trainer.mlx_sft import _clipping_optimizer
 
 console = Console()
 
@@ -437,30 +445,83 @@ def adapter_disabled(model: Any) -> Iterator[int]:
 
 
 # --------------------------------------------------------------------------
-# Trainer (scaffolding until the loop lands)
+# Trainer
 # --------------------------------------------------------------------------
 
+#: The template the transformers path installs when the tokenizer has none.
+FALLBACK_CHAT_TEMPLATE = "{% for msg in messages %}{{ msg['content'] }}\n{% endfor %}"
 
-class MLXGRPOTrainerWrapper:
-    """Minimal GRPO training wrapper for MLX backend."""
 
-    def __init__(self, config: Any) -> None:
-        self.config = config
-        self.model = None
-        self.tokenizer = None
+def _hf_tokenizer(tokenizer: Any) -> Any:
+    """The Hugging Face tokenizer under mlx-lm's ``TokenizerWrapper``.
 
-    def _require_mlx(self) -> None:
-        try:
-            import mlx  # noqa: F401
-            import mlx.core  # noqa: F401
-        except ImportError as exc:
-            raise ImportError(
-                "MLX backend requires the 'mlx' and 'mlx-lm' packages. "
-                "Install with: pip install \"soup-cli[mlx]\""
-            ) from exc
+    TRL renders and decodes with the HF tokenizer itself; the wrapper's own
+    ``apply_chat_template`` adds a thinking switch TRL does not pass.
+    """
+    return getattr(tokenizer, "_tokenizer", tokenizer)
+
+
+class MLXGRPOTrainerWrapper(MLXDPOTrainerWrapper):
+    """GRPO on MLX. Reuses MLX SFT's model loading and LoRA attach and MLX DPO's
+    optimizer plan, clipping, reporting and atomic adapter writer."""
+
+    objective = "GRPO"
+    ignores_chat_template = False  # applied, as the transformers path does
+
+    def __init__(self, config: Any, **kwargs: Any) -> None:
+        for key, flag in (("deepspeed_config", "--deepspeed"), ("fsdp_config", "--fsdp")):
+            if kwargs.get(key):
+                raise ValueError(
+                    f"MLX GRPO: {flag} is not supported on backend 'mlx' (one process "
+                    "on Apple Silicon). Remove it, or use backend: transformers."
+                )
+        super().__init__(config, **kwargs)
+        self._prompts: Optional[dict] = None
+        self._skipped = 0
+
+    # -- data, before the model loads ----------------------------------------
+
+    def _prepare(self, dataset: dict) -> None:
+        """Prompts, golds and units, refused before any model is loaded."""
+        from soup_cli.trainer.grpo import _prepare_grpo_dataset, _validate_grpo_reward_metadata
+        from soup_cli.trainer.rewards import BUILTIN_REWARDS, validate_reward_funcs
+
+        tcfg = self.config.training
+        name = str(tcfg.reward_fn)
+        if name not in BUILTIN_REWARDS:
+            raise ValueError(
+                f"MLX GRPO scores with the built-in rewards only ({', '.join(BUILTIN_REWARDS)}); "
+                f"got reward_fn={name!r}"
+            )
+        train = _prepare_grpo_dataset(list(dataset.get("train") or []))
+        _validate_grpo_reward_metadata(train, tcfg, split="train")
+        val = _prepare_grpo_dataset(list(dataset.get("val") or []))
+        if val:
+            _validate_grpo_reward_metadata(val, tcfg, split="validation")
+        batch_size = int(tcfg.batch_size) if isinstance(tcfg.batch_size, int) else 1
+        units = resolve_units(
+            batch_size=batch_size, accum=int(tcfg.gradient_accumulation_steps),
+            num_generations=int(tcfg.num_generations),
+        )
+        if units.bumped:
+            console.print(
+                f"[dim]MLX GRPO: training.batch_size {batch_size} is below num_generations; "
+                f"using {units.completions_per_step} completions per micro-step, as the "
+                "transformers path does[/]"
+            )
+        # Refuses a split smaller than one update now rather than after the load.
+        plan_prompt_updates(n_prompts=len(train), prompts_per_update=units.prompts_per_update,
+                            epochs=1, seed=0)
+        self._reward_fn = validate_reward_funcs(BUILTIN_REWARDS[name])
+        self._reward_name = name
+        self._prompts = {"train": train, "val": val}
+        self._units = units
 
     def setup(self, dataset: dict) -> None:
         self._require_mlx()
+        self._check_unsupported()
+        self._prepare(dataset)
+
         from soup_cli.utils.mlx import load_mlx_model
 
         cfg = self.config
@@ -468,16 +529,393 @@ class MLXGRPOTrainerWrapper:
         self.model, self.tokenizer = load_mlx_model(
             cfg.base, quantization=cfg.training.quantization
         )
+        self._check_dense(self.model)
+        console.print(
+            f"[green]MLX model loaded:[/] {cfg.base} (task=grpo, lora_r={cfg.training.lora.r})"
+        )
         self._dataset = dataset
 
-    def train(self, resume_from: Optional[str] = None) -> None:
-        """MLX GRPO training loop.
+    def _check_dense(self, model: Any) -> None:
+        import mlx.nn as nn
 
-        Requires a group-generation + reward-scoring loop in MLX. This wrapper
-        is scaffolding for the v0.25.0 release.
-        """
-        self._require_mlx()
-        raise NotImplementedError(
-            "MLX GRPO training loop is scaffolding in v0.25.0. Full "
-            "implementation depends on upstream mlx-lm GRPO support."
+        quantized = [
+            name for name, module in model.named_modules()
+            if isinstance(module, (nn.QuantizedLinear, nn.QuantizedEmbedding))
+        ]
+        if quantized:
+            raise ValueError(
+                f"MLX GRPO trains a dense base in this release, and {self.config.base} is "
+                f"quantized ({len(quantized)} quantized layer(s), first: {quantized[0]}). "
+                "Use an unquantized (bf16 / fp16 / fp32) base, or backend: transformers."
+            )
+
+    # -- tokens ---------------------------------------------------------------
+
+    def _template(self) -> Any:
+        from soup_cli.data.chat_templates import apply_chat_template_override
+
+        hf = _hf_tokenizer(self.tokenizer)
+        apply_chat_template_override(hf, self.config.data.chat_template, console=console)
+        if not getattr(hf, "chat_template", None):
+            hf.chat_template = FALLBACK_CHAT_TEMPLATE
+        if not isinstance(getattr(hf, "eos_token_id", None), int):
+            raise ValueError(
+                "MLX GRPO: the tokenizer has no eos_token_id, so no completion can end"
+            )
+        return hf
+
+    @staticmethod
+    def _render(hf: Any, messages: list, split: str, index: int) -> list:
+        ids = _as_ids(hf.apply_chat_template(messages, add_generation_prompt=True, tokenize=True))
+        if not ids:
+            raise ValueError(f"MLX GRPO: {split} prompt {index} renders to no tokens")
+        return [int(i) for i in ids]
+
+    @staticmethod
+    def _decode(hf: Any, sequences: list) -> list:
+        return list(hf.batch_decode(sequences, skip_special_tokens=True))
+
+    def _check_context(self, prompt_ids: list, max_new: int) -> None:
+        limit = getattr(getattr(self.model, "args", None), "max_position_embeddings", None)
+        if not isinstance(limit, int) or not prompt_ids:
+            return
+        longest = max(len(ids) for ids in prompt_ids)
+        if longest + max_new > limit:
+            raise ValueError(
+                f"MLX GRPO: the longest prompt ({longest} tokens) plus "
+                f"max_completion_length (data.max_length = {max_new}) exceeds the model's "
+                f"context of {limit} tokens. Lower data.max_length to at most "
+                f"{max(1, limit - longest)} or shorten the prompts."
+            )
+
+    # -- forward passes ---------------------------------------------------------
+
+    def _verify_head_split(self, sample: list) -> Optional[tuple]:
+        """The chunked vocab head, if it reproduces the full model on real tokens."""
+        import mlx.core as mx
+
+        split = resolve_head_split(self.model)
+        if split is None:
+            console.print(
+                "[yellow]MLX GRPO: computing log-probs over the full vocabulary (no frozen "
+                "vocab head found); long completions need more memory[/]"
+            )
+            return None
+        tokens = mx.array([list(sample) + [int(sample[-1])]])
+        self.model.eval()
+        full = completion_token_logps(self.model, tokens, 0)
+        chunked = completion_token_logps(self.model, tokens, 0, head_split=split)
+        same = mx.allclose(full, chunked, rtol=1e-3, atol=1e-2).item()
+        self.model.train()
+        if not same:
+            console.print(
+                "[yellow]MLX GRPO: this architecture changes logits after the vocab head; "
+                "using the full-vocabulary path (more memory)[/]"
+            )
+            return None
+        return split
+
+    def _reference_logps(self, tokens: Any, start: int) -> Any:
+        """Base-model log-probs of the generated tokens: the adapter switched off."""
+        import mlx.core as mx
+
+        was_training = bool(getattr(self.model, "training", True))
+        self.model.eval()
+        try:
+            with adapter_disabled(self.model):
+                ref = mx.stop_gradient(
+                    completion_token_logps(self.model, tokens, start, head_split=self._head_split)
+                )
+                mx.eval(ref)
+        finally:
+            if was_training:
+                self.model.train()
+        return ref
+
+    def _rollout(self, hf: Any, prompt_ids: list, eos: int, max_new: int) -> tuple:
+        """``num_generations`` completions per prompt from the current policy."""
+        group = self._units.num_generations
+        completions, terminated = [], []
+        for ids in prompt_ids:
+            for tokens, done in generate_group(
+                self.model, ids, num_generations=group, max_tokens=max_new, eos_token_id=eos,
+            ):
+                completions.append(tokens)
+                terminated.append(done)
+        return completions, terminated, self._decode(hf, completions)
+
+    # -- metadata -------------------------------------------------------------
+
+    def _objective_metadata(self) -> dict:
+        tcfg = self.config.training
+        beta = float(tcfg.grpo_beta)
+        units = self._units
+        return {
+            "task": "grpo",
+            **grpo_contract(beta=beta, num_generations=units.num_generations,
+                            max_completion_length=int(self.config.data.max_length)),
+            "reward_fn": self._reward_name,
+            "reference": (
+                "base model (every LoRA scale 0) on the generated tokens, once per rollout"
+                if beta != 0.0 else "none (beta = 0: no reference forward)"
+            ),
+            "generation": (
+                "current policy once per update, train mode (LoRA dropout active), "
+                "mlx-lm model call with a KV cache, stops on tokenizer.eos_token_id"
+            ),
+            "batch_size_unit": "completions per micro-step",
+            "prompts_per_update": units.prompts_per_update,
+            "completions_per_update": units.completions_per_update,
+            "watchdog": (
+                "a nonfinite loss or gradient skips the update: weights, optimizer moments, "
+                "optimizer step and learning-rate schedule unchanged"
+            ),
+            "skipped_steps": self._skipped,
+        }
+
+    def _format_metrics(self, metrics: dict) -> str:
+        text = (
+            f"reward {metrics['reward']:.3f} (std {metrics['reward_std']:.3f}, zero-std groups "
+            f"{metrics['frac_reward_zero_std']:.2f}), completion length "
+            f"{metrics['completions/mean_length']:.1f}, "
+            f"clipped {metrics['completions/clipped_ratio']:.2f}"
         )
+        if "kl" in metrics:
+            text += f", kl {metrics['kl']:.4f}"
+        return text
+
+    # -- loop -------------------------------------------------------------------
+
+    def train(self, display=None, tracker=None, run_id=None, resume_from_checkpoint=None) -> dict:
+        self._require_mlx()
+        if resume_from_checkpoint is not None:
+            raise ValueError(RESUME_REFUSAL)
+
+        import mlx.core as mx
+        import mlx.nn as nn
+        from mlx.utils import tree_flatten, tree_map
+
+        from soup_cli.trainer.mlx_optim import build_optimizer, plan_optimizer
+        from soup_cli.utils.seeding import resolve_training_seed
+
+        cfg = self.config
+        tcfg = cfg.training
+        if self.model is None or self.tokenizer is None:
+            raise RuntimeError("MLX backend: setup(dataset) must be called before train()")
+        if self._prompts is None:
+            self._prepare(self._dataset)
+
+        seed = resolve_training_seed(tcfg)
+        mx.random.seed(seed)
+        units = self._units
+        group, step_size, accum = units.num_generations, units.completions_per_step, units.accum
+        beta = float(tcfg.grpo_beta)
+        max_new = int(cfg.data.max_length)
+        output_dir = Path(cfg.output)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        hf = self._template()
+        eos = int(hf.eos_token_id)
+        train_rows, val_rows = self._prompts["train"], self._prompts["val"]
+        train_ids = [self._render(hf, r["prompt"], "train", i) for i, r in enumerate(train_rows)]
+        val_ids = [self._render(hf, r["prompt"], "validation", i) for i, r in enumerate(val_rows)]
+        self._check_context(train_ids + val_ids, max_new)
+        plan = plan_prompt_updates(n_prompts=len(train_rows),
+                                   prompts_per_update=units.prompts_per_update,
+                                   epochs=int(tcfg.epochs), seed=seed)
+        total_updates = len(plan)
+        per_epoch = max(1, len(train_rows) // units.prompts_per_update)
+
+        self._check_dense(self.model)
+        self._apply_lora(self.model)
+        if tcfg.gradient_checkpointing:
+            from mlx_lm.tuner.trainer import grad_checkpoint
+
+            grad_checkpoint(self.model.layers[0])
+        self._head_split = self._verify_head_split(train_ids[0])
+
+        optimizer_plan = plan_optimizer(
+            lr=float(tcfg.lr),
+            optimizer=str(getattr(tcfg, "optimizer", "adamw_torch")),
+            scheduler=str(getattr(tcfg, "scheduler", "cosine")),
+            warmup_ratio=float(getattr(tcfg, "warmup_ratio", 0.0) or 0.0),
+            weight_decay=float(getattr(tcfg, "weight_decay", 0.0) or 0.0),
+            total_updates=total_updates,
+        )
+        for warning in optimizer_plan.warnings:
+            console.print(f"[yellow]MLX backend: {warning}[/]")
+        optimizer = _clipping_optimizer(build_optimizer(optimizer_plan), float(tcfg.max_grad_norm))
+
+        def loss_fn(model, tokens, mask, start, advantages, ref, num_items):
+            logps = completion_token_logps(model, tokens, start, head_split=self._head_split)
+            return grpo_token_loss(logps, advantages, mask, num_items=num_items, beta=beta,
+                                   ref_logps=ref)
+
+        loss_and_grad = nn.value_and_grad(self.model, loss_fn)
+
+        def save(path: Path) -> None:
+            partial = path.with_name(path.stem + ".partial.safetensors")
+            mx.save_safetensors(str(partial), dict(tree_flatten(self.model.trainable_parameters())))
+            partial.replace(path)
+
+        def write_config() -> None:
+            self._write_adapter_config(
+                output_dir, batch_size=step_size, iters=total_updates * accum, accum=accum,
+                optimizer_plan=optimizer_plan, seed=seed, data_seed=seed,
+            )
+
+        self._skipped = 0
+        write_config()  # before the first update, as MLX DPO / ORPO do
+        console.print(
+            f"[dim]MLX GRPO: {total_updates} update(s); each generates {group} completion(s) "
+            f"for {units.prompts_per_update} prompt(s) and trains on them in {accum} "
+            f"micro-step(s) of {step_size}[/]"
+        )
+
+        save_steps = int(getattr(tcfg, "save_steps", 0) or 0)
+        logging_steps = max(1, int(getattr(tcfg, "logging_steps", 10) or 10))
+        losses: list = []
+        history: list = []
+        if display is not None:
+            display.start(total_updates)
+        self.model.train()
+        t0 = tic = time.time()
+        logged_at = 0
+        try:
+            for update, chunk in enumerate(plan, start=1):
+                rows = [train_rows[i] for i in chunk]
+                prompt_ids = [train_ids[i] for i in chunk]
+                completions, terminated, texts = self._rollout(hf, prompt_ids, eos, max_new)
+                rewards = score_completions(self._reward_fn, rows, texts, completions, group)
+                advantages = group_advantages(rewards, group)
+                samples = [(prompt_ids[k // group], c) for k, c in enumerate(completions)]
+                num_items = float(sum(len(c) for c in completions))
+
+                grads, loss_total = None, 0.0
+                sums: dict = {}
+                for micro in range(accum):
+                    part = slice(micro * step_size, (micro + 1) * step_size)
+                    tokens, mask, start = collate_completions(samples[part])
+                    tokens, mask = mx.array(tokens), mx.array(mask)
+                    ref = self._reference_logps(tokens, start) if beta != 0.0 else None
+                    (loss, part_sums), part_grads = loss_and_grad(
+                        self.model, tokens, mask, start, mx.array(advantages[part]), ref,
+                        num_items,
+                    )
+                    grads = (part_grads if grads is None
+                             else tree_map(lambda a, b: a + b, grads, part_grads))
+                    mx.eval(loss, grads, *part_sums.values())
+                    _clear_allocator_cache()
+                    loss_total += loss.item()
+                    for key, value in part_sums.items():
+                        sums[key] = sums.get(key, 0.0) + value.item()
+
+                finite = math.isfinite(loss_total)
+                if finite:
+                    ok = mx.array(True)
+                    for _, g in tree_flatten(grads):
+                        ok = mx.logical_and(ok, mx.all(mx.isfinite(g)))
+                    finite = bool(ok.item())
+                if finite:
+                    optimizer.update(self.model, grads)
+                    mx.eval(self.model.parameters(), optimizer.state)
+                    losses.append(loss_total)
+                else:
+                    self._skipped += 1
+                    console.print(
+                        f"[yellow]MLX GRPO: update {update}: nonfinite loss or gradient; "
+                        "update skipped (weights, optimizer moments, step and learning-rate "
+                        "schedule unchanged)[/]"
+                    )
+                grads = None
+
+                if save_steps > 0 and update % save_steps == 0:
+                    save(output_dir / f"{update:07d}_adapters.safetensors")
+
+                lengths = [len(c) for c in completions]
+                tokens_seen = max(1.0, sums.get("tokens", 0.0))
+                stats = reward_statistics(rewards, group)
+                metrics = {
+                    "loss": loss_total,
+                    **stats,
+                    f"rewards/{self._reward_name}/mean": stats["reward"],
+                    f"rewards/{self._reward_name}/std": stats["reward_std"],
+                    "completions/mean_length": sum(lengths) / len(lengths),
+                    "completions/min_length": float(min(lengths)),
+                    "completions/max_length": float(max(lengths)),
+                    "completions/clipped_ratio": terminated.count(False) / len(terminated),
+                    "clip_ratio/low_mean": sums.get("clip_low", 0.0) / tokens_seen,
+                    "clip_ratio/high_mean": sums.get("clip_high", 0.0) / tokens_seen,
+                    "clip_ratio/region_mean": sums.get("clip_region", 0.0) / tokens_seen,
+                    "num_items": num_items,
+                    "skipped_steps": self._skipped,
+                }
+                if beta != 0.0:
+                    metrics["kl"] = sums.get("kl", 0.0) / tokens_seen
+                history.append(metrics)
+
+                if update % logging_steps == 0 or update == total_updates:
+                    now = time.time()
+                    speed = (update - logged_at) / max(now - tic, 1e-9)
+                    tic, logged_at = now, update
+                    self._report(
+                        display, tracker, run_id, step=update, epoch=update / per_epoch,
+                        loss=loss_total, lr=self._current_lr(optimizer, tcfg.lr), speed=speed,
+                        metrics=metrics, val=None,
+                    )
+        finally:
+            if display is not None:
+                display.stop()
+        duration = time.time() - t0
+
+        save(output_dir / "adapters.safetensors")
+        val = self._validate(hf, val_rows, val_ids, eos, max_new, seed)
+        write_config()
+
+        result = {
+            **summarize_training_loss([{"loss": loss} for loss in losses]),
+            "losses": losses,
+            "history": history,
+            "total_steps": total_updates,
+            "skipped_steps": self._skipped,
+            "duration_secs": duration,
+            "duration": f"{duration:.0f}s",
+            "output_dir": str(output_dir),
+        }
+        if history:
+            result.update({k: v for k, v in history[-1].items() if k != "loss"})
+        if val is not None:
+            result.update(val)
+            console.print(f"[dim]MLX GRPO: validation reward {val['val_reward']:.4f}[/]")
+        if self._skipped:
+            console.print(
+                f"[yellow]MLX GRPO: {self._skipped} of {total_updates} update(s) skipped on a "
+                "nonfinite loss or gradient[/]"
+            )
+        console.print(f"[green]MLX GRPO training complete:[/] {output_dir}")
+        return result
+
+    def _validate(self, hf: Any, rows: list, prompt_ids: list, eos: int, max_new: int,
+                  seed: int) -> Optional[dict]:
+        """The held-out prompts' mean reward: same sampling, no parameter change."""
+        if not rows:
+            return None
+        import mlx.core as mx
+
+        group = self._units.num_generations
+        was_training = bool(getattr(self.model, "training", True))
+        self.model.eval()
+        mx.random.seed(seed)
+        rewards: list = []
+        try:
+            for row, ids in zip(rows, prompt_ids):
+                outs = generate_group(self.model, ids, num_generations=group,
+                                      max_tokens=max_new, eos_token_id=eos)
+                completions = [tokens for tokens, _ in outs]
+                rewards += score_completions(self._reward_fn, [row], self._decode(hf, completions),
+                                             completions, group)
+        finally:
+            if was_training:
+                self.model.train()
+        stats = reward_statistics(rewards, group)
+        return {"val_reward": stats["reward"], "val_reward_std": stats["reward_std"]}

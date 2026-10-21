@@ -16,8 +16,12 @@ The objective is the one Soup's transformers path trains on TRL 0.29.1, whose
 
 from __future__ import annotations
 
+import json
 import math
 import random
+import subprocess
+import sys
+import textwrap
 
 import numpy as np
 import pytest
@@ -682,6 +686,20 @@ class TestGeneration:
             np.testing.assert_allclose(step[0], np.array(full[0, len(prompt) - 1 + k]),
                                        atol=1e-4)
 
+    def test_the_gold_never_reaches_the_prompt(self):
+        from soup_cli.trainer.grpo import _prepare_grpo_dataset
+        from soup_cli.trainer.mlx_grpo import MLXGRPOTrainerWrapper
+
+        rows = _prepare_grpo_dataset([{"messages": [
+            {"role": "user", "content": "what is 2 3?"},
+            {"role": "assistant", "content": "the answer is 97531"},
+        ]}])
+        tok = DigitTokenizer()
+        ids = MLXGRPOTrainerWrapper._render(tok, rows[0]["prompt"], "train", 0)
+        text = tok.decode(ids)
+        assert rows[0]["answer"] == "the answer is 97531"
+        assert "97531" not in text and text.endswith("<a>")
+
 
 class TestReference:
     def _model(self):
@@ -745,3 +763,642 @@ class TestReference:
         with pytest.raises(RuntimeError, match="no LoRA module"):
             with adapter_disabled(_tiny_llama()):
                 pass
+
+
+# --------------------------------------------------------------------------
+# Training through the real wrapper
+# --------------------------------------------------------------------------
+
+#: The training vocabulary: ``<think>`` and ``</think>`` are single tokens, so a
+#: random model's completions earn 0, 0.5 or 1.0 from the ``format`` reward and
+#: rewards differ inside a group. Prompt characters and digits fill the rest.
+_TRAIN_CHARS = ["<think>", "</think>", "x", " ", "<", ">", "|", "u", "a", "q", "?",
+                *"0123456789"]
+_TRAIN_VOCAB = len(_TRAIN_CHARS) + 3
+
+_GRPO_YAML = """
+base: tiny-base
+task: grpo
+backend: mlx
+data:
+  train: ./x.jsonl
+  max_length: 64
+training:
+  epochs: 1
+  lr: 0.05
+  batch_size: 4
+  gradient_accumulation_steps: 1
+  num_generations: 4
+  grpo_beta: 0.1
+  reward_fn: format
+  warmup_ratio: 0.0
+  logging_steps: 1
+  quantization: none
+  lora: {r: 4, alpha: 8, dropout: 0.0}
+output: ./output
+"""
+
+
+_WITH_CHATML = "  max_length: 64\n  chat_template: chatml\n"
+
+
+def _prompt_rows(n=8, prefix="q"):
+    return [{"prompt": f"{prefix}{i}?", "answer": str(i % 10)} for i in range(n)]
+
+
+def _config(**training):
+    from soup_cli.config.loader import load_config_from_string
+
+    text = _GRPO_YAML
+    for key, value in training.items():
+        line = f"  {key}: {value}\n"
+        own = [x for x in text.splitlines(keepends=True) if x.startswith(f"  {key}:")]
+        text = text.replace(own[0], line) if own else text.replace(
+            "  quantization: none\n", "  quantization: none\n" + line)
+    return load_config_from_string(text)
+
+
+def _wrapper(tmp_path, monkeypatch, *, train=None, val=None, model_seed=0, **training):
+    pytest.importorskip("mlx.core")
+    pytest.importorskip("mlx_lm")
+    from soup_cli.trainer.mlx_grpo import MLXGRPOTrainerWrapper
+
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    monkeypatch.chdir(tmp_path)
+    wrapper = MLXGRPOTrainerWrapper(_config(**training))
+    wrapper.model = _tiny_llama(seed=model_seed, vocab=_TRAIN_VOCAB)
+    wrapper.tokenizer = DigitTokenizer(_TRAIN_CHARS)
+    wrapper._dataset = {"train": _prompt_rows() if train is None else train,
+                        "val": [] if val is None else val}
+    return wrapper
+
+
+class _RecordingOptimizer:
+    """Delegates to the real (clipping) optimizer; snapshots after each update."""
+
+    def __init__(self, inner):
+        self.__dict__["inner"] = inner
+        self.__dict__["snapshots"] = []
+
+    def update(self, model, grads):
+        mx = pytest.importorskip("mlx.core")
+        from mlx.utils import tree_flatten
+
+        out = self.inner.update(model, grads)
+        mx.eval(model.parameters(), self.inner.state)
+        self.snapshots.append((_flat(model.trainable_parameters()),
+                               {k: np.array(v) for k, v in tree_flatten(self.inner.state)}))
+        return out
+
+    def __getattr__(self, name):
+        return getattr(self.__dict__["inner"], name)
+
+
+def _record_optimizer(monkeypatch):
+    from soup_cli.trainer import mlx_grpo
+
+    made = []
+    real = mlx_grpo._clipping_optimizer
+
+    def build(inner, max_norm):
+        made.append(_RecordingOptimizer(real(inner, max_norm)))
+        return made[-1]
+
+    monkeypatch.setattr(mlx_grpo, "_clipping_optimizer", build)
+    return made
+
+
+def _policy_logps(model, samples, adapter=True):
+    mx = pytest.importorskip("mlx.core")
+    from soup_cli.trainer.mlx_grpo import (
+        adapter_disabled,
+        collate_completions,
+        completion_token_logps,
+    )
+
+    tokens, mask, start = collate_completions(samples)
+    model.eval()
+    if adapter:
+        out = completion_token_logps(model, mx.array(tokens), start)
+    else:
+        with adapter_disabled(model):
+            out = completion_token_logps(model, mx.array(tokens), start)
+    return np.array(out), np.array(mask, dtype=np.float64)
+
+
+class TestTraining:
+    def test_lora_trains_the_base_stays_frozen_and_rewards_differ(self, tmp_path, monkeypatch):
+        wrapper = _wrapper(tmp_path, monkeypatch)
+        before = _flat(wrapper.model.parameters())
+        result = wrapper.train()
+        after = _flat(wrapper.model.parameters())
+        lora_b = [v for k, v in after.items() if k.endswith("lora_b")]
+        assert lora_b and any(np.abs(v).sum() > 0 for v in lora_b)
+        for name, value in before.items():
+            key = name if name in after else name.replace(".weight", ".linear.weight")
+            np.testing.assert_array_equal(after[key], value, err_msg=name)
+        assert result["total_steps"] == 8 and len(result["losses"]) == 8
+        assert all(math.isfinite(x) for x in result["losses"])
+        assert any(h["frac_reward_zero_std"] < 1.0 for h in result["history"])
+        assert result["skipped_steps"] == 0
+        assert not list((tmp_path / "output").glob("*.partial*"))
+
+    def test_one_update_raises_the_advantage_weighted_log_likelihood(self, tmp_path, monkeypatch):
+        """beta 0, SGD: the update ascends sum_i A_i log p(completion_i)."""
+        from soup_cli.trainer import mlx_grpo
+
+        seen = {}
+        real_rollout = mlx_grpo.MLXGRPOTrainerWrapper._rollout
+        real_adv = mlx_grpo.group_advantages
+
+        def rollout(self, hf, prompt_ids, eos, max_new):
+            out = real_rollout(self, hf, prompt_ids, eos, max_new)
+            g = self._units.num_generations
+            seen["samples"] = [(prompt_ids[k // g], c) for k, c in enumerate(out[0])]
+            return out
+
+        def advantages(rewards, group):
+            seen["adv"] = real_adv(rewards, group)
+            return seen["adv"]
+
+        monkeypatch.setattr(mlx_grpo.MLXGRPOTrainerWrapper, "_rollout", rollout)
+        monkeypatch.setattr(mlx_grpo, "group_advantages", advantages)
+        rows = _prompt_rows(1)
+        wrapper = _wrapper(tmp_path, monkeypatch, train=rows, grpo_beta=0.0, optimizer="sgd",
+                           scheduler="constant", lr=0.02, seed=6)
+        wrapper.train()
+        adv = np.array(seen["adv"])
+        assert np.abs(adv).max() > 0.5, "fixture must give unequal rewards in the group"
+        after, mask = _policy_logps(wrapper.model, seen["samples"])
+        # The adapter's B started at zero: with it switched off this is the policy
+        # the completions were sampled from.
+        before, _ = _policy_logps(wrapper.model, seen["samples"], adapter=False)
+        objective = lambda lp: float((adv[:, None] * lp * mask).sum())  # noqa: E731
+        assert objective(after) > objective(before) + 1e-3
+        moved = ((after - before) * mask).sum(axis=1)
+        assert all(np.sign(moved[i]) == np.sign(a) for i, a in enumerate(adv) if abs(a) > 0.5)
+
+    def test_micro_batches_accumulate_to_one_batch_without_dividing(self, tmp_path, monkeypatch):
+        """DAPO: one normaliser, the token count of the whole update; no /accum."""
+        def run(path, batch_size, accum):
+            wrapper = _wrapper(path, monkeypatch, train=_prompt_rows(2), batch_size=batch_size,
+                               gradient_accumulation_steps=accum, optimizer="sgd",
+                               scheduler="constant", seed=7)
+            result = wrapper.train()
+            return result, _flat(wrapper.model.trainable_parameters())
+
+        one, w1 = run(tmp_path / "a", 8, 1)
+        two, w2 = run(tmp_path / "b", 4, 2)
+        assert len(one["losses"]) == len(two["losses"]) == 1
+        assert one["num_items"] == two["num_items"]
+        assert one["losses"][0] == pytest.approx(two["losses"][0], abs=1e-6)
+        assert max(np.abs(v).max() for k, v in w1.items() if k.endswith("lora_b")) > 1e-4
+        for name in w1:
+            np.testing.assert_allclose(w1[name], w2[name], atol=1e-6, err_msg=name)
+
+    def test_a_fixed_seed_reproduces_the_run(self, tmp_path, monkeypatch):
+        def run(path, seed):
+            wrapper = _wrapper(path, monkeypatch, seed=seed)
+            return wrapper.train(), _flat(wrapper.model.trainable_parameters())
+
+        a, wa = run(tmp_path / "a", 3)
+        b, wb = run(tmp_path / "b", 3)
+        c, _ = run(tmp_path / "c", 4)
+        assert a["losses"] == b["losses"] and a["losses"] != c["losses"]
+        for name in wa:
+            np.testing.assert_array_equal(wa[name], wb[name])
+
+    @pytest.mark.parametrize("poison", ["loss", "gradient"])
+    def test_a_nonfinite_update_is_skipped_and_leaves_everything(self, tmp_path, monkeypatch,
+                                                                 poison):
+        mx = pytest.importorskip("mlx.core")
+        from soup_cli.trainer import mlx_grpo
+
+        made = _record_optimizer(monkeypatch)
+        real = mlx_grpo.grpo_token_loss
+        calls = []
+
+        def poisoned(logps, *args, **kwargs):
+            loss, sums = real(logps, *args, **kwargs)
+            calls.append(1)
+            if len(calls) == 2:
+                if poison == "loss":
+                    loss = loss * mx.array(float("nan"))
+                else:  # a finite value with a NaN gradient
+                    loss = loss + mx.where(mx.array(False), mx.sqrt(-1.0 - mx.abs(logps.sum())),
+                                           mx.array(0.0))
+            return loss, sums
+
+        monkeypatch.setattr(mlx_grpo, "grpo_token_loss", poisoned)
+        wrapper = _wrapper(tmp_path, monkeypatch, train=_prompt_rows(2))
+        result = wrapper.train()
+        assert result["skipped_steps"] == 1 and len(result["losses"]) == 1
+        snapshots = made[0].snapshots
+        assert len(snapshots) == 1, "the poisoned update must not reach the optimizer"
+        weights, state = snapshots[0]
+        for name, value in _flat(wrapper.model.trainable_parameters()).items():
+            np.testing.assert_array_equal(value, weights[name], err_msg=name)
+        from mlx.utils import tree_flatten
+
+        final_state = {k: np.array(v) for k, v in tree_flatten(made[0].state)}
+        assert final_state.keys() == state.keys()
+        for name, value in state.items():
+            np.testing.assert_array_equal(final_state[name], value, err_msg=name)
+        assert int(final_state["step"]) == 1
+        meta = json.loads((tmp_path / "output" / "adapter_config.json").read_text())
+        assert meta["skipped_steps"] == 1
+
+    def test_beta_zero_runs_no_reference_forward(self, tmp_path, monkeypatch):
+        from soup_cli.trainer import mlx_grpo
+
+        def refuse(*args, **kwargs):
+            raise AssertionError("reference forward with beta = 0")
+
+        monkeypatch.setattr(mlx_grpo, "adapter_disabled", refuse)
+        monkeypatch.setattr(mlx_grpo.MLXGRPOTrainerWrapper, "_reference_logps", refuse)
+        result = _wrapper(tmp_path, monkeypatch, grpo_beta=0.0).train()
+        assert "kl" not in result and len(result["losses"]) == 8
+
+    def test_beta_runs_the_reference_once_per_micro_batch(self, tmp_path, monkeypatch):
+        from soup_cli.trainer import mlx_grpo
+
+        calls = []
+        real = mlx_grpo.MLXGRPOTrainerWrapper._reference_logps
+
+        def counted(self, tokens, start):
+            calls.append(int(tokens.shape[0]))
+            return real(self, tokens, start)
+
+        monkeypatch.setattr(mlx_grpo.MLXGRPOTrainerWrapper, "_reference_logps", counted)
+        result = _wrapper(tmp_path, monkeypatch, train=_prompt_rows(4), batch_size=4,
+                          gradient_accumulation_steps=2).train()
+        assert calls == [4, 4, 4, 4] and result["kl"] >= 0.0
+
+    def test_the_reference_stays_the_base_model_after_updates(self, tmp_path, monkeypatch):
+        mx = pytest.importorskip("mlx.core")
+        from soup_cli.trainer.mlx_grpo import completion_token_logps
+
+        wrapper = _wrapper(tmp_path, monkeypatch, lr=0.1)
+        samples = [([3, 4, 5], [6, 7, EOS]), ([3, 4], [8, 9, 10, EOS])]
+        from soup_cli.trainer.mlx_grpo import collate_completions
+
+        tokens, _, start = collate_completions(samples)
+        wrapper.model.eval()
+        base = np.array(completion_token_logps(wrapper.model, mx.array(tokens), start))
+        wrapper.train()
+        ref, _ = _policy_logps(wrapper.model, samples, adapter=False)
+        policy, _ = _policy_logps(wrapper.model, samples)
+        np.testing.assert_array_equal(ref, base)
+        assert np.abs(policy - base).max() > 1e-3
+
+    def test_validation_reward_is_reported_and_changes_nothing(self, tmp_path, monkeypatch):
+        mx = pytest.importorskip("mlx.core")
+
+        wrapper = _wrapper(tmp_path, monkeypatch, val=_prompt_rows(3, prefix="v"))
+        result = wrapper.train()
+        assert 0.0 <= result["val_reward"] <= 1.0 and "val_reward_std" in result
+        saved = mx.load(str(tmp_path / "output" / "adapters.safetensors"))
+        for name, value in _flat(wrapper.model.trainable_parameters()).items():
+            np.testing.assert_array_equal(np.array(saved[name]), value, err_msg=name)
+        again = _wrapper(tmp_path / "again", monkeypatch, val=_prompt_rows(3, prefix="v")).train()
+        assert again["val_reward"] == result["val_reward"]
+
+    def test_metadata_is_complete_and_written_before_the_first_update(self, tmp_path,
+                                                                     monkeypatch):
+        from soup_cli.trainer import mlx_grpo
+
+        early = []
+        real = mlx_grpo.MLXGRPOTrainerWrapper._rollout
+
+        def rollout(self, *args):
+            path = tmp_path / "output" / "adapter_config.json"
+            if not early:
+                early.append(json.loads(path.read_text()))
+            return real(self, *args)
+
+        monkeypatch.setattr(mlx_grpo.MLXGRPOTrainerWrapper, "_rollout", rollout)
+        _wrapper(tmp_path, monkeypatch, train=_prompt_rows(2)).train()
+        meta = json.loads((tmp_path / "output" / "adapter_config.json").read_text())
+        expected = {
+            "task": "grpo", "loss_type": "dapo", "scale_rewards": "group", "epsilon": 0.2,
+            "epsilon_high": 0.2, "num_iterations": 1, "importance_sampling_level": "token",
+            "beta": 0.1, "num_generations": 4, "max_completion_length": 64,
+            "temperature": 1.0, "top_p": 1.0, "top_k": 0, "min_p": None,
+            "repetition_penalty": 1.0, "mask_truncated_completions": False,
+            "advantage_epsilon": 1e-4, "reward_fn": "format", "skipped_steps": 0,
+            "prompts_per_update": 1, "completions_per_update": 4, "fine_tune_type": "lora",
+        }
+        assert {k: meta[k] for k in expected} == expected
+        for key in ("advantage_std", "reference", "generation", "watchdog", "seed"):
+            assert meta[key] not in (None, "")
+        assert "sample" in meta["advantage_std"] and "LoRA scale 0" in meta["reference"]
+        assert early and early[0]["task"] == "grpo" and early[0]["loss_type"] == "dapo"
+
+    def test_beta_zero_metadata_names_no_reference(self, tmp_path, monkeypatch):
+        _wrapper(tmp_path, monkeypatch, train=_prompt_rows(1), grpo_beta=0.0).train()
+        meta = json.loads((tmp_path / "output" / "adapter_config.json").read_text())
+        assert meta["beta"] == 0.0 and meta["reference"].startswith("none")
+
+    def test_prompts_keep_their_own_gold_in_the_loop(self, tmp_path, monkeypatch):
+        """Shuffled order, identical prompt text with different golds."""
+        rows = [{"prompt": "q?", "answer": str(i), "rid": i} for i in range(4)]
+        wrapper = _wrapper(tmp_path, monkeypatch, train=rows, epochs=2, reward_fn="accuracy")
+        wrapper._prepare(wrapper._dataset)
+        seen = []
+
+        def reward(completions, answer, rid, **_):
+            seen.extend(zip(answer, rid))
+            return [0.0] * len(completions)
+
+        from soup_cli.trainer.rewards import validate_reward_funcs
+
+        wrapper._reward_fn = validate_reward_funcs(reward)
+        wrapper.train()
+        assert len(seen) == 2 * 4 * 4
+        assert all(answer == str(rid) for answer, rid in seen)
+        order = [rid for _, rid in seen[::4]]
+        assert sorted(order[:4]) == [0, 1, 2, 3] and order != [0, 1, 2, 3, 0, 1, 2, 3]
+
+    def test_a_prompt_too_long_for_the_context_is_refused(self, tmp_path, monkeypatch):
+        wrapper = _wrapper(tmp_path, monkeypatch)
+        wrapper.model.args.max_position_embeddings = 70
+        with pytest.raises(ValueError, match="exceeds the model's context of 70"):
+            wrapper.train()
+
+    def test_resume_is_refused(self, tmp_path, monkeypatch):
+        wrapper = _wrapper(tmp_path, monkeypatch)
+        with pytest.raises(ValueError, match="#1977"):
+            wrapper.train(resume_from_checkpoint=str(tmp_path / "x.safetensors"))
+
+    def test_a_quantized_base_is_refused(self, tmp_path, monkeypatch):
+        """`quantization: 4bit` is the default and only names a pre-quantized base on
+        MLX, so the base itself is checked once loaded (Step 2 adds 4-bit)."""
+        nn = pytest.importorskip("mlx.nn")
+        wrapper = _wrapper(tmp_path, monkeypatch)
+        nn.quantize(wrapper.model, group_size=32, bits=4)
+        with pytest.raises(ValueError, match="trains a dense base"):
+            wrapper.train()
+
+    def test_setup_refuses_a_quantized_base_right_after_loading(self, tmp_path, monkeypatch):
+        nn = pytest.importorskip("mlx.nn")
+        import soup_cli.utils.mlx as mlx_utils
+        from soup_cli.trainer.mlx_grpo import MLXGRPOTrainerWrapper
+
+        model = _tiny_llama(vocab=_TRAIN_VOCAB)
+        nn.quantize(model, group_size=32, bits=4)
+        monkeypatch.setattr(mlx_utils, "load_mlx_model",
+                            lambda *a, **k: (model, DigitTokenizer(_TRAIN_CHARS)))
+        wrapper = MLXGRPOTrainerWrapper(_config(quantization="4bit"))
+        with pytest.raises(ValueError, match="is quantized"):
+            wrapper.setup({"train": _prompt_rows(2)})
+
+
+class TestFreshProcessReload:
+    def test_logits_reproduce_and_the_adapter_has_an_effect(self, tmp_path, monkeypatch):
+        mx = pytest.importorskip("mlx.core")
+
+        wrapper = _wrapper(tmp_path, monkeypatch, lr=0.1)
+        base_path = tmp_path / "base.safetensors"
+        wrapper.model.save_weights(str(base_path))
+        wrapper.train()
+        tokens = np.array([[3, 4, 5, 6, 7, 8, 9]])
+        wrapper.model.eval()
+        logits = np.array(wrapper.model(mx.array(tokens)))
+        script = textwrap.dedent(f"""
+            import json, sys
+            import numpy as np
+            import mlx.core as mx
+            from mlx_lm.models import llama
+            from mlx_lm.tuner.utils import load_adapters
+            args = llama.ModelArgs(model_type="llama", hidden_size=32, num_hidden_layers=2,
+                intermediate_size=64, num_attention_heads=4, num_key_value_heads=2,
+                rms_norm_eps=1e-5, vocab_size={_TRAIN_VOCAB}, tie_word_embeddings=True)
+            model = llama.Model(args)
+            model.load_weights({str(base_path)!r})
+            if sys.argv[1] == "adapter":
+                load_adapters(model, {str(tmp_path / "output")!r})
+            model.eval()
+            out = model(mx.array({tokens.tolist()!r}))
+            print(json.dumps(np.array(out).tolist()))
+        """)
+
+        def run(mode):
+            out = subprocess.run([sys.executable, "-c", script, mode], capture_output=True,
+                                 text=True, check=True, timeout=300)
+            return np.array(json.loads(out.stdout.strip().splitlines()[-1]))
+
+        reloaded, base = run("adapter"), run("base")
+        np.testing.assert_allclose(reloaded, logits, rtol=1e-5, atol=1e-5)
+        assert np.abs(base - reloaded).max() > 1e-3
+
+
+# --------------------------------------------------------------------------
+# Data and setup: everything refused before the model loads (no MLX needed)
+# --------------------------------------------------------------------------
+
+
+class _NoLoad:
+    def __init__(self, monkeypatch):
+        import soup_cli.utils.mlx as mlx_utils
+
+        def load(*args, **kwargs):
+            raise AssertionError("the model must not load")
+
+        monkeypatch.setattr(mlx_utils, "load_mlx_model", load)
+
+
+def _setup_wrapper(monkeypatch, **training):
+    from soup_cli.trainer.mlx_grpo import MLXGRPOTrainerWrapper
+
+    wrapper = MLXGRPOTrainerWrapper(_config(**training))
+    monkeypatch.setattr(wrapper, "_require_mlx", lambda: None)
+    _NoLoad(monkeypatch)
+    return wrapper
+
+
+class TestData:
+    def test_string_messages_and_alpaca_rows_become_prompts_with_golds(self, monkeypatch):
+        wrapper = _setup_wrapper(monkeypatch, reward_fn="accuracy", batch_size=4)
+        rows = [
+            {"prompt": "add 1 2", "answer": "3"},
+            {"messages": [{"role": "user", "content": "add 2 2"},
+                          {"role": "assistant", "content": "#### 4"}]},
+            {"messages": [{"role": "system", "content": "be brief"},
+                          {"role": "user", "content": "add 2 3"},
+                          {"role": "assistant", "content": "5"}], "answer": "5"},
+            {"instruction": "add 3 3", "output": "6"},
+        ]
+        wrapper._prepare({"train": rows})
+        prompts = wrapper._prompts["train"]
+        assert prompts[0]["prompt"] == [{"role": "user", "content": "add 1 2"}]
+        assert prompts[1]["prompt"] == [{"role": "user", "content": "add 2 2"}]
+        assert prompts[1]["answer"] == "#### 4"
+        assert prompts[2]["prompt"][0]["role"] == "system" and len(prompts[2]["prompt"]) == 2
+        assert [p["answer"] for p in prompts] == ["3", "#### 4", "5", "6"]
+
+    def test_a_missing_gold_is_refused_before_the_model_loads(self, monkeypatch):
+        wrapper = _setup_wrapper(monkeypatch, reward_fn="accuracy")
+        rows = _prompt_rows(4) + [{"prompt": "q?"}]
+        with pytest.raises(ValueError, match="row 4 is missing or empty 'answer'"):
+            wrapper.setup({"train": rows})
+
+    def test_an_unreadable_validation_gold_is_refused_before_the_model_loads(self, monkeypatch):
+        wrapper = _setup_wrapper(monkeypatch, reward_fn="accuracy")
+        val = [{"prompt": "q?", "answer": "either 41 or 42 is the answer is 41 or 42"}]
+        with pytest.raises(ValueError, match="GRPO validation row 0"):
+            wrapper.setup({"train": _prompt_rows(4), "val": val})
+
+    def test_too_few_prompts_for_one_update_are_refused_before_the_model_loads(self,
+                                                                             monkeypatch):
+        wrapper = _setup_wrapper(monkeypatch, batch_size=4, gradient_accumulation_steps=2)
+        with pytest.raises(ValueError, match="1 prompt.*fewer than the 2"):
+            wrapper.setup({"train": _prompt_rows(1)})
+
+    def test_partial_groups_are_refused_before_the_model_loads(self, monkeypatch):
+        wrapper = _setup_wrapper(monkeypatch, batch_size=6)
+        with pytest.raises(ValueError, match="must be divisible by num_generations"):
+            wrapper.setup({"train": _prompt_rows(8)})
+
+    def test_batch_size_auto_is_one_group(self, monkeypatch):
+        wrapper = _setup_wrapper(monkeypatch, batch_size="auto", gradient_accumulation_steps=1)
+        wrapper._prepare({"train": _prompt_rows(2)})
+        assert wrapper._units.completions_per_step == 4 and wrapper._units.bumped
+
+    @pytest.mark.parametrize("kwarg, flag", [("deepspeed_config", "--deepspeed"),
+                                             ("fsdp_config", "--fsdp")])
+    def test_distributed_launch_options_are_refused(self, kwarg, flag):
+        from soup_cli.trainer.mlx_grpo import MLXGRPOTrainerWrapper
+
+        with pytest.raises(ValueError, match=flag):
+            MLXGRPOTrainerWrapper(_config(), **{kwarg: {"x": 1}})
+        MLXGRPOTrainerWrapper(_config(), deepspeed_config=None, fsdp_config=None, device="mps")
+
+    def test_the_chat_template_override_and_fallback_are_applied(self):
+        from soup_cli.trainer.mlx_grpo import FALLBACK_CHAT_TEMPLATE, MLXGRPOTrainerWrapper
+
+        class Bare(DigitTokenizer):
+            chat_template = None
+
+        class Wrapped:  # mlx-lm's TokenizerWrapper keeps the HF tokenizer here
+            def __init__(self, inner):
+                self._tokenizer = inner
+
+        wrapper = MLXGRPOTrainerWrapper(_config())
+        wrapper.tokenizer = Wrapped(Bare())
+        assert wrapper._template().chat_template == FALLBACK_CHAT_TEMPLATE
+        from soup_cli.config.loader import load_config_from_string
+
+        text = _GRPO_YAML.replace("  max_length: 64\n", _WITH_CHATML)
+        wrapper = MLXGRPOTrainerWrapper(load_config_from_string(text))
+        wrapper.tokenizer = Wrapped(Bare())
+        assert "<|im_start|>" in wrapper._template().chat_template
+
+
+# --------------------------------------------------------------------------
+# Config, dispatch, doctor and the CLI
+# --------------------------------------------------------------------------
+
+
+class TestConfig:
+    def test_grpo_on_mlx_loads_with_inactive_defaults_and_dispatches(self):
+        from soup_cli.config.loader import load_config_from_string
+        from soup_cli.trainer.mlx_grpo import MLXGRPOTrainerWrapper
+        from soup_cli.trainer.mlx_routing import get_mlx_trainer
+
+        minimal = """
+base: tiny-base
+task: grpo
+backend: mlx
+data: {train: ./x.jsonl}
+training:
+  quantization: none
+output: ./output
+"""
+        cfg = load_config_from_string(minimal)
+        assert (cfg.task, cfg.backend, cfg.training.grpo_beta) == ("grpo", "mlx", 0.1)
+        assert get_mlx_trainer("grpo") is MLXGRPOTrainerWrapper
+
+    @pytest.mark.parametrize("line, match", [
+        ("quantization: 8bit", "quantization='8bit' is not supported by task='grpo'"),
+        ("lora: {r: 0}", "lora.r must be at least 1 for task='grpo'"),
+        ("lora: {r: 4, use_dora: true}", "MLX DoRA requires task='sft'"),
+        ("reward_fn: ./my_reward.py", "does not load custom reward files"),
+        ("reward_fn: accuracy,format", "is a reward ensemble"),
+        ("eval_steps: 5", "training.eval_steps is not applied by task='grpo' on backend='mlx'"),
+        ("echo_trap_enabled: true", "training.echo_trap_enabled is not applied"),
+        ("rl_checkpoint_save_every_steps: 5", "rl_checkpoint_save_every_steps is not applied"),
+        ("quantize_ref_model: true", "quantize_ref_model is not applied"),
+        ("curriculum: true", "training.curriculum is not applied"),
+        ("grpo_variant: gspo", "grpo_variant is not supported on backend=mlx"),
+        ("prm_reward: ./prm", "prm_reward requires backend='transformers'"),
+        ("rollout_backend: openenv", "rollout_backend is not supported on backend=mlx"),
+        ("vllm_sleep_mode: true", "vllm_sleep_mode requires backend"),
+        ("tis_threshold: 2.0", "GRPO stability fields ['tis_threshold']"),
+        ("skip_zero_advantage: true", "GRPO stability fields ['skip_zero_advantage']"),
+        ("use_lorafa: true", "use_lorafa requires backend='transformers'"),
+        ("loraplus_lr_ratio: 16", "loraplus_lr_ratio is not implemented on backend='mlx'"),
+        ("relora_steps: 10", "relora_steps is not supported on the mlx backend"),
+        ("long_context_grpo: true", "long_context_grpo is not supported on backend=mlx"),
+        ("stream_layers: true", "stream_layers cannot be used with task='grpo'"),
+    ])
+    def test_each_unsupported_setting_is_refused_at_load(self, line, match):
+        key, value = line.split(": ", 1)
+        with pytest.raises(Exception, match=match.replace("[", r"\[").replace("]", r"\]")
+                           .replace("(", r"\(").replace(")", r"\)").replace(".", r"\.")):
+            _config(**{key: value})
+
+    def test_reward_verifiable_is_refused(self):
+        with pytest.raises(Exception, match="reward_fn='verifiable' is not supported"):
+            _config(reward_fn="verifiable", verifiable_domain="math")
+
+    def test_vision_modality_is_refused(self):
+        from soup_cli.config.loader import load_config_from_string
+
+        with pytest.raises(Exception, match="modality='vision' is not supported by task='grpo'"):
+            load_config_from_string(_GRPO_YAML.replace("backend: mlx\n",
+                                                       "backend: mlx\nmodality: vision\n"))
+
+    def test_the_transformers_route_is_unchanged(self):
+        from soup_cli.config.loader import load_config_from_string
+
+        text = _GRPO_YAML.replace("backend: mlx", "backend: transformers")
+        cfg = load_config_from_string(text.replace("  quantization: none\n",
+                                                   "  quantization: 4bit\n  eval_steps: 5\n"))
+        assert (cfg.backend, cfg.training.quantization, cfg.training.eval_steps) == (
+            "transformers", "4bit", 5)
+
+    def test_doctor_reports_ignored_settings_but_not_the_applied_template(self):
+        from soup_cli.config.backend_support import check_config
+        from soup_cli.config.loader import load_config_from_string
+
+        text = _GRPO_YAML.replace("  max_length: 64\n", _WITH_CHATML)
+        cfg = load_config_from_string(text.replace("  quantization: none\n",
+                                                   "  quantization: none\n  use_galore: true\n"))
+        assert {e.field for e in check_config(cfg)} == {"training.use_galore"}
+
+    def test_the_ignored_settings_are_printed_without_the_template(self, monkeypatch):
+        from io import StringIO
+
+        from rich.console import Console
+
+        from soup_cli.config.loader import load_config_from_string
+        from soup_cli.trainer import mlx_dpo
+        from soup_cli.trainer.mlx_grpo import MLXGRPOTrainerWrapper
+
+        buffer = StringIO()
+        monkeypatch.setattr(mlx_dpo, "console", Console(file=buffer, width=400))
+        text = _GRPO_YAML.replace("  max_length: 64\n", _WITH_CHATML)
+        cfg = load_config_from_string(text.replace("  quantization: none\n",
+                                                   "  quantization: none\n  use_galore: true\n"))
+        MLXGRPOTrainerWrapper(cfg)._check_unsupported()
+        printed = buffer.getvalue()
+        assert "MLX backend ignores: GaLore" in printed and "chat_template" not in printed
+
+    def test_cli_resume_is_refused_before_anything_loads(self, capsys):
+        import typer
+
+        from soup_cli.commands.train import _resolve_resume_or_exit
+
+        with pytest.raises(typer.Exit):
+            _resolve_resume_or_exit("auto", _config())
+        assert "#1977" in capsys.readouterr().out

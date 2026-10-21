@@ -96,12 +96,13 @@ def test_the_mlx_wrappers_still_do_not_read_the_seed(monkeypatch):
     commit instead of leaving a run lying about itself."""
     import inspect
 
-    from soup_cli.trainer import mlx_grpo, mlx_sft
+    from soup_cli.trainer import mlx_sft
 
-    # mlx_dpo is not here: it runs its own loop and seeds `mx.random` and the
-    # batch order (tests/test_mlx_dpo.py pins the reproducibility), so it never
-    # carried the warning.
-    for module in (mlx_sft, mlx_grpo):
+    # mlx_dpo and mlx_grpo are not here: they run their own loops and seed
+    # `mx.random` and the batch / prompt order (tests/test_mlx_dpo.py and
+    # tests/test_mlx_grpo.py pin the reproducibility), so neither carries the
+    # warning.
+    for module in (mlx_sft,):
         source = inspect.getsource(module)
         # `_check_unsupported` legitimately mentions the field it is warning
         # about, so the sources are checked for an actual RNG call instead.

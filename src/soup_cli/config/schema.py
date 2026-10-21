@@ -4940,10 +4940,135 @@ UNSLOTH_SETUP_TASKS: frozenset[str] = frozenset({
     "pretrain", "embedding", "tts",
 })
 
-#: The tasks with a trainer on ``backend: mlx``: SFT through mlx-lm's tuner and
-#: DPO through Soup's own loop (``trainer/mlx_dpo.py``). Validators that defer
+#: The tasks with a trainer on ``backend: mlx``: SFT through mlx-lm's tuner;
+#: DPO, ORPO and GRPO through Soup's own loops (``trainer/mlx_dpo.py``,
+#: ``trainer/mlx_orpo.py``, ``trainer/mlx_grpo.py``). Validators that defer
 #: to :meth:`SoupConfig._validate_mlx_task_support` read this, not ``"sft"``.
-MLX_TASKS: frozenset[str] = frozenset({"sft", "dpo", "orpo"})
+MLX_TASKS: frozenset[str] = frozenset({"sft", "dpo", "orpo", "grpo"})
+
+#: #1976 — the built-in rewards the native MLX GRPO loop scores with.
+MLX_GRPO_REWARDS: frozenset[str] = frozenset({"accuracy", "format"})
+
+_MLX_GRPO_NOT_GENERATED_HERE = "MLX GRPO generates with its own mlx-lm loop"
+
+#: #1976 — GRPO settings the transformers path applies and the native MLX loop
+#: does not, with the reason the refusal gives. Each is refused at load when it
+#: differs from its default; a default never fails.
+_MLX_GRPO_UNAPPLIED: dict[str, str] = {
+    "rollout_backend": "multi-turn agent rollouts run on the transformers path only",
+    "rollout_func": "multi-turn agent rollouts run on the transformers path only",
+    "prm_aggregate": "process reward models (training.prm_reward) are not scored on MLX",
+    "vllm_sleep_mode": f"{_MLX_GRPO_NOT_GENERATED_HERE}, not vLLM",
+    "async_grpo_prefetch": f"{_MLX_GRPO_NOT_GENERATED_HERE}, one rollout per update",
+    "grpo_fp16": "the MLX loop has no fp16 GRPO mode",
+    "grpo_delta": "two-sided clipping is not part of the objective MLX trains",
+    "long_context_grpo": "long-context GRPO runs on the transformers path only",
+    "vision_grpo": "MLX GRPO trains on text prompts only",
+    "ref_model_ema_alpha": "the MLX reference is the frozen base model",
+    "quantize_ref_model": "the MLX reference is the base model with the adapter off",
+    "quantize_reward_model": "MLX GRPO scores with the built-in rewards only",
+    "tis_threshold": "MLX GRPO generates on-policy and applies no importance correction",
+    "off_policy_mask_threshold": "MLX GRPO generates on-policy and applies no off-policy mask",
+    "mask_truncated_completions": "truncated completions are trained, as TRL's default does",
+    "skip_zero_advantage": "zero-advantage groups are trained, as TRL's default does",
+    "eval_steps": "MLX GRPO scores the validation split once, after training "
+    "(val_reward), with no mid-run evaluation",
+    "use_lorafa": "LoRA-FA has no MLX implementation",
+    "relora_steps": "ReLoRA restarts run on the transformers path only",
+    "curriculum": "curriculum ordering runs on the transformers path only",
+}
+
+#: Field-name prefixes refused the same way: every reward-hack / echo-trap
+#: controller, mid-run RL checkpoint and curriculum setting.
+_MLX_GRPO_UNAPPLIED_PREFIXES: dict[str, str] = {
+    "reward_hack_": "the reward-hack controllers observe the transformers GRPO trainer only",
+    "echo_trap_": "the echo-trap detector observes the transformers GRPO trainer only",
+    "rl_checkpoint_": "mid-run RL checkpoints are written by the transformers GRPO trainer "
+    "only (MLX GRPO saves adapters every training.save_steps updates)",
+    "curriculum_": "curriculum ordering runs on the transformers path only",
+}
+
+
+def _refuse_mlx_grpo_scope(cfg: Any) -> None:
+    """#1976 — what ``task: grpo`` on ``backend: mlx`` trains, refused at load.
+
+    The native loop (``trainer/mlx_grpo.py``) trains a LoRA adapter on a dense
+    text base with one of the built-in rewards. Everything else is refused here,
+    before the model loads, with the setting's name and a remedy.
+    """
+    tcfg = cfg.training
+    if cfg.modality != "text":
+        raise ValueError(
+            f"modality='{cfg.modality}' is not supported by task='grpo' on "
+            "backend='mlx': MLX GRPO trains on text prompts only. Use "
+            "backend=transformers, or modality: text."
+        )
+    if int(tcfg.lora.r) < 1:
+        raise ValueError(
+            "training.lora.r must be at least 1 for task='grpo' on backend='mlx': "
+            "MLX GRPO trains a LoRA adapter and its KL reference is the base with "
+            "the adapter switched off; full fine-tuning is not implemented on "
+            "backend='mlx'."
+        )
+    # '4bit' is the schema default and, on MLX, only names a pre-quantized base
+    # (load_mlx_model does not quantize), so it cannot be refused here without
+    # failing every default config; the trainer refuses a base that loads
+    # quantized instead, right after the load. '8bit' is refused outright.
+    if tcfg.quantization == "8bit":
+        raise ValueError(
+            "training.quantization='8bit' is not supported by task='grpo' on "
+            "backend='mlx': MLX GRPO trains a dense (unquantized) base in this "
+            "release. Set training.quantization: none and use an unquantized base, "
+            "or use backend: transformers."
+        )
+    if tcfg.prm_reward is not None:
+        raise ValueError(
+            "training.prm_reward is not supported by task='grpo' on backend='mlx': "
+            "MLX GRPO scores completions with the built-in rewards "
+            f"({', '.join(sorted(MLX_GRPO_REWARDS))}) only. Remove "
+            "training.prm_reward, or use backend: transformers."
+        )
+    spec = str(tcfg.reward_fn or "")
+    parts = [part.strip() for part in spec.split(",")]
+    if len(parts) > 1:
+        raise ValueError(
+            f"training.reward_fn={spec!r} is a reward ensemble, which MLX GRPO does "
+            "not score: set one built-in reward "
+            f"({' or '.join(repr(n) for n in sorted(MLX_GRPO_REWARDS))}), or use "
+            "backend: transformers."
+        )
+    if parts[0] == "verifiable":
+        raise ValueError(
+            "training.reward_fn='verifiable' is not supported by task='grpo' on "
+            "backend='mlx': MLX GRPO scores with the built-in "
+            f"{' or '.join(repr(n) for n in sorted(MLX_GRPO_REWARDS))} reward only. "
+            "Use one of them, or backend: transformers."
+        )
+    if parts[0] not in MLX_GRPO_REWARDS:
+        raise ValueError(
+            f"training.reward_fn={spec!r} is not supported by task='grpo' on "
+            "backend='mlx': MLX GRPO does not load custom reward files; it scores "
+            f"with the built-in {' or '.join(repr(n) for n in sorted(MLX_GRPO_REWARDS))} "
+            "reward only. Use one of them, or backend: transformers."
+        )
+    fields = type(tcfg).model_fields
+    for name, info in fields.items():
+        why = _MLX_GRPO_UNAPPLIED.get(name)
+        if why is None:
+            why = next(
+                (reason for prefix, reason in _MLX_GRPO_UNAPPLIED_PREFIXES.items()
+                 if name.startswith(prefix)),
+                None,
+            )
+        if why is None:
+            continue
+        value = getattr(tcfg, name)
+        if value == info.get_default(call_default_factory=True):
+            continue
+        raise ValueError(
+            f"training.{name} is not applied by task='grpo' on backend='mlx': {why}. "
+            f"Remove training.{name}, or use backend: transformers."
+        )
 
 #: #1497 — the tasks whose trainer reads ``training.freeze_layers`` /
 #: ``training.freeze_ratio``: ``SFTTrainerWrapper._setup_transformers``, which
@@ -5771,8 +5896,9 @@ class SoupConfig(BaseModel):
             )
         if self.backend == "mlx":
             raise ValueError(
-                "grpo_variant is not supported on backend=mlx in v0.50.0 "
-                "(MLX GRPO is scaffolded; new RL objectives transformers-only)"
+                "grpo_variant is not supported on backend=mlx: MLX GRPO trains "
+                "TRL's default objective (loss_type='dapo') only. Remove "
+                "training.grpo_variant, or use backend: transformers."
             )
         return self
 
@@ -8283,14 +8409,17 @@ class SoupConfig(BaseModel):
 
     @model_validator(mode="after")
     def _validate_mlx_task_support(self) -> "SoupConfig":
-        """MLX backend supports sft, dpo and orpo.
+        """MLX backend supports sft, dpo, orpo and grpo.
 
-        SFT runs through mlx-lm's tuner; DPO and ORPO through Soup's own loop
-        in ``trainer/mlx_dpo.py`` / ``trainer/mlx_orpo.py``. Every other task --
-        GRPO included, whose MLX wrapper is still scaffolding -- is refused here
-        rather than at ``train()`` time.
+        SFT runs through mlx-lm's tuner; DPO, ORPO and GRPO through Soup's own
+        loops in ``trainer/mlx_dpo.py`` / ``trainer/mlx_orpo.py`` /
+        ``trainer/mlx_grpo.py``. Every other task is refused here rather than
+        at ``train()`` time.
         """
         if self.backend != "mlx":
+            return self
+        if self.task == "grpo":
+            _refuse_mlx_grpo_scope(self)
             return self
         if self.task in ("dpo", "orpo"):
             # The native preference loops tokenize text and chat rows only and
@@ -8327,7 +8456,7 @@ class SoupConfig(BaseModel):
         if self.task in MLX_TASKS:
             return self
         raise ValueError(
-            f"MLX backend only ships SFT, DPO and ORPO; task='{self.task}' has no "
+            f"MLX backend only ships SFT, DPO, ORPO and GRPO; task='{self.task}' has no "
             "trainer on backend='mlx'. "
             f"Use backend=transformers for task={self.task}."
         )
