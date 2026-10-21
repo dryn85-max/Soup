@@ -108,6 +108,13 @@ def _refuses_resume(func: ast.FunctionDef) -> bool:
     return False
 
 
+def _handles_resume(file_name: str, func: ast.FunctionDef) -> bool:
+    """Forwards the checkpoint, or (MLX GRPO only, #1977) refuses it in its body."""
+    if _forwards_resume(func):
+        return True
+    return file_name in _BODY_REFUSAL_ALLOWED and _refuses_resume(func)
+
+
 class TestTrainerScanInvariants:
     """Static AST verification that every trainer wrapper handles resume_from_checkpoint."""
 
@@ -187,10 +194,7 @@ class TestTrainerScanInvariants:
                         if is_refused:
                             continue
 
-                        # Only MLX GRPO may refuse in its body (#1977): every other
-                        # wrapper must forward the checkpoint or be task-refused.
-                        refuses = file_name in _BODY_REFUSAL_ALLOWED and _refuses_resume(item)
-                        if not _forwards_resume(item) and not refuses:
+                        if not _handles_resume(file_name, item):
                             failures.append(
                                 f"{file_name}::{node.name}.train() accepts resume_from_checkpoint "
                                 f"but does not forward it and task {task_name!r} is not in "
@@ -490,3 +494,6 @@ def test_only_the_listed_wrapper_may_refuse_resume_in_its_body():
     func = tree.body[0]
     assert _refuses_resume(func) and not _forwards_resume(func)
     assert _BODY_REFUSAL_ALLOWED == {"mlx_grpo.py"}
+    assert _handles_resume("mlx_grpo.py", func)
+    assert not _handles_resume("mlx_dpo.py", func)
+    assert not _handles_resume("sft.py", func)
