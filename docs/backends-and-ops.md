@@ -398,6 +398,7 @@ training:
   the untrained LoRA policy), non-text `modality`, DoRA, LoRA+ and
   `data.chat_template` (as for MLX DPO and ORPO). The other settings MLX DPO
   does not apply are not applied here either.
+
 #### GRPO on MLX
 
 `task: grpo` with `backend: mlx` runs Soup's own loop: each optimizer update
@@ -1193,12 +1194,22 @@ Every `soup train` run is automatically tracked in a local SQLite database (`~/.
 
 ### Recorded base identity
 
-For single-process resident Hugging Face loads on the Transformers backend, `soup train` resolves
+For single-process Hugging Face loads on the Transformers backend (resident or
+layer-streamed), `soup train` resolves
 the base's commit once, immediately before its first model/tokenizer/processor/config
 load, and passes that commit to the run's subsequent base loads. The original `base`
 name stays in the config and experiments row; unrelated teacher, reward and scorer
 repositories do not receive its revision. `soup runs show` displays the revision and
 its source.
+
+Layer streaming pins its tokenizer, architecture config, probe/final meta
+skeletons and both checkpoint download passes. Known Hub commits use separate
+shard and materialized-weight cache slots; repeated loads of one commit reuse
+its slot. Local paths and unknown revisions retain the existing cache behavior.
+The config, PEFT base name and run metadata continue to name the original base.
+The first pinned streamed run after upgrading re-shards and re-copies the base
+into the new `<slug>@<commit>` cache slots, costing disk space and time; old slots
+are left in place.
 
 The new nullable `runs.base_revision`, `runs.base_revision_source` and
 `runs.training_data_sha256` columns upgrade existing databases in place. Historical
@@ -1224,11 +1235,11 @@ Loading a local adapter folder directly also reuses that commit when its
 `adapter_config.json` names the same base and has no conflicting explicit revision;
 the tokenizer still comes from the adapter folder.
 
-**First-stage boundaries:** Non-HF hubs, Unsloth, MLX, layer-streaming and distributed loads remain unbound and
+**Remaining boundaries:** Non-HF hubs, Unsloth, MLX and distributed loads remain unbound and
 are recorded as such; a cache-path hint on any backend is still unverified. Standalone
 wrapper/sweep invocations do not automatically establish a run scope. Metadata is
 written for the final artifact, not each intermediate checkpoint. Other exporters
-(including ONNX/TensorRT and native AWQ/GPTQ/torchao loaders), remote adapter sidecars
+(including ONNX/TensorRT and native torchao loaders), remote adapter sidecars
 and independent teacher/reward/scorer repositories do not gain a binding guarantee.
 Evaluation engines that bypass the shared live-eval loader (including lm-eval's
 adapter benchmark path and vLLM) also remain unbound in this stage.

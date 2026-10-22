@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import re
+import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any
 
@@ -75,6 +76,11 @@ _UNWIRED_TRAINING_TUNABLES = (
     # the loader warns about them with the refusal date, so they are not listed here.
     "forgetting_threshold",
 )
+
+
+def _stdin_isatty() -> bool:
+    """True when standard input is an interactive terminal."""
+    return sys.stdin.isatty()
 
 
 def _nondefault_unwired_training_settings(training_config) -> list[str]:
@@ -691,7 +697,10 @@ def train(
         False,
         "--yes",
         "-y",
-        help="Skip confirmation prompt",
+        help=(
+            "Skip the start-training confirmation. Required when stdin is "
+            "not a TTY (scripts, CI, pipes)."
+        ),
     ),
     trust_remote_code: bool = typer.Option(
         False,
@@ -1737,6 +1746,18 @@ def train(
             raise typer.Exit(1) from exc
 
     if not dry_run and not yes:
+        # #1913: on a non-TTY stdin the confirm can never be answered — a pipe
+        # hangs until its writer closes (EOF aborts via typer) and an
+        # unattended service waits forever. Fail with the escape hatch named.
+        from soup_cli.utils.exit_codes import EXIT_USAGE_ERROR
+
+        if not _stdin_isatty():
+            console.print(
+                "[red]stdin is not a TTY, so the start-training confirmation "
+                "cannot be answered.[/] Pass --yes to start without the "
+                "confirmation."
+            )
+            raise typer.Exit(EXIT_USAGE_ERROR)
         if not typer.confirm("Start training?", default=True):
             console.print("[yellow]Cancelled.[/]")
             raise typer.Exit()
@@ -1906,7 +1927,7 @@ def train(
         base_identity = BaseRevision(
             run_base,
             binding_supported=(cfg.backend == "transformers" and hub_name == "hf"
-                               and not cfg.training.stream_layers and not is_in_distributed()),
+                               and not is_in_distributed()),
         )
         with base_revision_scope(base_identity):
             trainer_wrapper = build_trainer(cfg, **trainer_kwargs)
