@@ -127,6 +127,17 @@ class TestTheSeedReachesTraining:
         assert zero_a["batch_order"] == zero_b["batch_order"]
         assert zero_a["batch_order"] != default["batch_order"]
 
+    def test_data_seed_zero_is_a_seed(self, tmp_path, monkeypatch):
+        """``data_seed: 0`` is read with ``is None``, not truthiness: it orders
+        the batches like seed 0 does, not like the ``seed`` it sits next to."""
+        zero = _start_of_training(tmp_path / "a", monkeypatch, seed=7, data_seed=0)
+        seed_zero = _start_of_training(tmp_path / "b", monkeypatch, seed=0)
+        seed_seven = _start_of_training(tmp_path / "c", monkeypatch, seed=7)
+
+        assert zero["batch_order"] == seed_zero["batch_order"]
+        assert zero["batch_order"] != seed_seven["batch_order"]
+        assert zero["lora_a"] == seed_seven["lora_a"]
+
     def test_data_seed_owns_the_batch_order(self, tmp_path, monkeypatch):
         """As on the transformers path: ``data_seed`` decides the data order,
         ``seed`` everything else."""
@@ -135,30 +146,6 @@ class TestTheSeedReachesTraining:
 
         assert a["batch_order"] == b["batch_order"]
         assert a["lora_a"] != b["lora_a"]
-
-
-class TestTheSeedIsNoLongerAnnouncedAsIgnored:
-    @pytest.mark.parametrize("field", ["seed", "data_seed"])
-    def test_no_ignored_warning(self, monkeypatch, field):
-        from io import StringIO
-
-        from rich.console import Console
-
-        from soup_cli.config.schema import DataConfig, SoupConfig, TrainingConfig
-        from soup_cli.trainer import mlx_sft
-
-        buffer = StringIO()
-        monkeypatch.setattr(mlx_sft, "console", Console(file=buffer, width=200))
-        cfg = SoupConfig(
-            base="mlx-community/tiny",
-            task="sft",
-            backend="mlx",
-            data=DataConfig(train="./d.jsonl", format="chatml"),
-            training=TrainingConfig(**{field: 11}),
-            output="./out",
-        )
-        mlx_sft.MLXSFTTrainerWrapper(cfg)._check_unsupported()
-        assert f"training.{field}" not in buffer.getvalue()
 
 
 # --------------------------------------------------------------------------

@@ -19,10 +19,10 @@ drift -- every entry must name a real field, and every dotted field name in
 the truth; it can only stop it rotting, which is the failure that produced #749.
 
 Scope today: ``task=sft`` on ``backend=mlx`` and on ``backend=unsloth`` (#1124;
-both apply to every modality), ``task=dpo``, ``task=orpo``, ``task=simpo``, ``task=kto`` and
-``task=grpo`` on ``backend=mlx``, plus multimodal vision and audio on ``backend=transformers``
-(#1156). Other combinations report nothing rather than guessing, which is the honest default
-for a table that has not been reviewed for them.
+both apply to every modality), ``task=dpo``, ``task=orpo``, ``task=simpo``, ``task=kto``
+and ``task=grpo`` on ``backend=mlx``, plus multimodal vision and audio on
+``backend=transformers`` (#1156). Other combinations report nothing rather than guessing,
+which is the honest default for a table that has not been reviewed for them.
 """
 
 from __future__ import annotations
@@ -194,12 +194,9 @@ _TRANSFORMERS_AUDIO_SFT: tuple[SupportEntry, ...] = (
 _UNSLOTH_SFT: tuple[SupportEntry, ...] = ()
 
 
-#: Fields MLX SFT warns about that have no meaning for DPO, or that MLX DPO
-#: honours: the seeds (its own loop seeds ``mx.random`` and the batch order)
-#: and SFT's response-masking switches (DPO supervises completions by design).
+#: Fields MLX SFT warns about that have no meaning for DPO: SFT's
+#: response-masking switches (DPO supervises completions by design).
 _NOT_DPO_GAPS = frozenset({
-    "training.seed",
-    "training.data_seed",
     "data.train_on_messages_with_train_field",
     "data.mask_history",
     "data.train_on_prompt",
@@ -291,8 +288,6 @@ TRAINER_MODULES: dict[tuple[str, str, str], tuple[str, ...]] = {
         "soup_cli/trainer/mlx_dpo.py",
         "soup_cli/trainer/mlx_sft.py",
         "soup_cli/trainer/mlx_optim.py",
-        "soup_cli/trainer/_trl_compat.py",
-        "soup_cli/trainer/loss_summary.py",
     ),
     ("grpo", "mlx", "text"): (
         "soup_cli/trainer/mlx_grpo.py",
