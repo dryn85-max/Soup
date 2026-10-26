@@ -26,6 +26,14 @@ import textwrap
 import numpy as np
 import pytest
 
+from tests.conftest import strip_ansi
+
+
+def _plain(text):
+    """Console output without SGR escapes, whitespace collapsed: what a reader sees
+    under FORCE_COLOR=1 or a narrow COLUMNS, where rich colours and wraps it."""
+    return " ".join(strip_ansi(text).split())
+
 # --------------------------------------------------------------------------
 # A digit tokenizer with HF's surface. Ids: 0 pad, 1 BOS, 2 EOS, 3.. chars.
 # Small enough that a tiny random model's completions often state a number.
@@ -159,6 +167,12 @@ class TestUnits:
         c = plan_prompt_updates(n_prompts=12, prompts_per_update=2, epochs=2, seed=4)
         assert a == b and a != c
         assert a[:6] != a[6:]
+
+    def test_exactly_one_update_of_prompts_trains(self):
+        from soup_cli.trainer.mlx_grpo import plan_prompt_updates
+
+        plan = plan_prompt_updates(n_prompts=3, prompts_per_update=3, epochs=2, seed=0)
+        assert len(plan) == 2 and all(sorted(chunk) == [0, 1, 2] for chunk in plan)
 
     def test_fewer_prompts_than_one_update_are_refused(self):
         from soup_cli.trainer.mlx_grpo import plan_prompt_updates
@@ -343,12 +357,14 @@ class TestRewardKwargs:
 # --------------------------------------------------------------------------
 
 #: (prompt length, completion length) per row: unequal lengths, one length-1.
-_ROWS = [(3, 3), (2, 4), (3, 1), (2, 2)]
-#: Advantages: positive, negative, zero, negative.
-_ADV = [1.3, -0.7, 0.0, -1.1]
-#: Ratio new/old per row: inside the trust region, above it, below it, above it.
-#: With A>0 a ratio of 1.5 clips high; with A<0 a ratio of 0.5 clips low.
-_RATIO = [1.1, 1.5, 0.5, 0.6]
+_ROWS = [(3, 3), (2, 4), (3, 1), (2, 2), (3, 2)]
+#: Advantages: positive, negative, zero, negative, positive.
+_ADV = [1.3, -0.7, 0.0, -1.1, 0.9]
+#: Ratio new/old per row: inside the trust region, above it, below it, below it,
+#: above it. Row 4 (A>0, 1.3 > 1.2) clips high and row 3 (A<0, 0.6 < 0.8) clips
+#: low; row 1 (A<0, 1.5) is above the region on the side that does not clip.
+#: 1.3 sits below 1 + 2 * epsilon, so a widened upper bound would not clip it.
+_RATIO = [1.1, 1.5, 0.5, 0.6, 1.3]
 
 
 def _fixture(seed=0, vocab=6):
@@ -462,20 +478,23 @@ class TestTheLossMatchesTheOracle:
             model, lambda m: _mlx_loss(m, tokens, mask, start, beta=0.0, old=old)[0]
         )(model)
         g = np.array(grads["logits"])
-        # Row 1 (A<0, ratio 1.5) is unclipped; rows 2 (A=0) and 3 (A<0, ratio 0.6 < 0.8,
-        # clipped low) give nothing, and row 0 (ratio 1.1) is inside the region.
+        # Row 1 (A<0, ratio 1.5) is unclipped; rows 2 (A=0), 3 (A<0, ratio 0.6 < 0.8,
+        # clipped low) and 4 (A>0, ratio 1.3 > 1.2, clipped high) give nothing, and
+        # row 0 (ratio 1.1) is inside the region.
         assert np.abs(g[0]).max() > 0 and np.abs(g[1]).max() > 0
         assert np.abs(g[2]).max() == 0 and np.abs(g[3]).max() == 0
+        assert np.abs(g[4]).max() == 0
         mx.eval(grads)
 
     def test_clip_metrics_count_each_side(self):
         tokens, mask, start, logits = _fixture()
         _, old, _ = _synthetic(logits, tokens, start)
         _, sums = _mlx_loss(_FixedLogits(logits), tokens, mask, start, beta=0.0, old=old)
-        # Row 3: A<0 and ratio 0.6 < 0.8 -> low; row 1: A<0, ratio 1.5 -> neither side.
+        # Row 3: A<0 and ratio 0.6 < 0.8 -> low; row 4: A>0 and ratio 1.3 > 1.2 -> high;
+        # row 1: A<0, ratio 1.5 -> neither side.
         assert sums["clip_low"].item() == _ROWS[3][1]
-        assert sums["clip_high"].item() == 0
-        assert sums["clip_region"].item() == _ROWS[3][1]
+        assert sums["clip_high"].item() == _ROWS[4][1]
+        assert sums["clip_region"].item() == _ROWS[3][1] + _ROWS[4][1]
         assert sums["tokens"].item() == sum(c for _, c in _ROWS)
 
     def test_beta_zero_needs_no_reference_and_beta_adds_the_k3_kl(self):
@@ -581,6 +600,78 @@ class TestTheOracleIsTrl:
             assert stub._metrics["train"]["kl"][0] == pytest.approx(
                 ((np.exp(d) - d - 1) * mask).sum() / mask.sum(), rel=1e-9
             )
+
+
+#: GRPOConfig fields mlx_grpo.py trains at TRL's default, so the transformers path
+#: must never pass them (review of #2182).
+_CONTRACT_FIELDS = frozenset({
+    "loss_type", "scale_rewards", "epsilon", "epsilon_high", "num_iterations",
+    "importance_sampling_level", "temperature", "top_p", "top_k", "min_p",
+    "repetition_penalty", "mask_truncated_completions", "delta",
+})
+
+
+class TestTheTrlContract:
+    """mlx_grpo.py's constants are TRL 0.29.1's ``GRPOConfig`` defaults, and Soup's
+    transformers path overrides none of them, as tests/test_mlx_kto.py pins KTO."""
+
+    def test_the_contract_is_grpoconfigs_defaults(self):
+        trl = pytest.importorskip("trl")
+        from soup_cli.trainer import mlx_grpo
+
+        fields = trl.GRPOConfig.__dataclass_fields__
+        assert fields["loss_type"].default == mlx_grpo.LOSS_TYPE == "dapo"
+        assert fields["scale_rewards"].default == mlx_grpo.SCALE_REWARDS == "group"
+        assert fields["epsilon"].default == mlx_grpo.EPSILON == 0.2
+        assert fields["epsilon_high"].default is None  # None means epsilon
+        assert mlx_grpo.EPSILON_HIGH == fields["epsilon"].default
+        assert fields["num_iterations"].default == mlx_grpo.NUM_ITERATIONS == 1
+        assert (fields["importance_sampling_level"].default
+                == mlx_grpo.IMPORTANCE_SAMPLING_LEVEL == "token")
+        assert fields["temperature"].default == mlx_grpo.TEMPERATURE == 1.0
+        assert fields["top_p"].default == mlx_grpo.TOP_P == 1.0
+        assert fields["top_k"].default == mlx_grpo.TOP_K == 0
+        assert fields["min_p"].default is None and mlx_grpo.MIN_P is None
+        assert fields["repetition_penalty"].default == mlx_grpo.REPETITION_PENALTY == 1.0
+        assert fields["mask_truncated_completions"].default is False
+        assert mlx_grpo.MASK_TRUNCATED_COMPLETIONS is False
+        assert fields["delta"].default is None  # no two-sided clipping by default
+        assert set(_CONTRACT_FIELDS) <= set(fields)
+
+    def test_the_recorded_contract_is_the_constants(self):
+        from soup_cli.trainer import mlx_grpo
+
+        contract = mlx_grpo.grpo_contract(beta=0.1, num_generations=4,
+                                          max_completion_length=64)
+        assert (contract["epsilon"], contract["epsilon_high"]) == (0.2, 0.2)
+        assert (contract["loss_type"], contract["scale_rewards"], contract["num_iterations"],
+                contract["importance_sampling_level"]) == ("dapo", "group", 1, "token")
+
+    def test_the_transformers_path_passes_none_of_them(self):
+        import ast
+        from pathlib import Path
+
+        import soup_cli.trainer.grpo as grpo
+
+        tree = ast.parse(Path(grpo.__file__).read_text(encoding="utf-8"))
+        passed: set = set()
+        built = 0
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if (isinstance(target, ast.Name) and target.id == "grpo_kwargs"
+                            and isinstance(node.value, ast.Dict)):
+                        built += 1
+                        passed |= {k.value for k in node.value.keys
+                                   if isinstance(k, ast.Constant)}
+                    elif (isinstance(target, ast.Subscript)
+                          and getattr(target.value, "id", "") == "grpo_kwargs"):
+                        passed.add(target.slice.value)
+            elif isinstance(node, ast.Call) and getattr(node.func, "id", "") == "GRPOConfig":
+                passed |= {kw.arg for kw in node.keywords if kw.arg}
+        assert built == 1
+        assert {"beta", "num_generations", "max_completion_length"} <= passed
+        assert not passed & _CONTRACT_FIELDS
 
 
 # --------------------------------------------------------------------------
@@ -1094,6 +1185,22 @@ class TestTraining:
         assert "sample" in meta["advantage_std"] and "LoRA scale 0" in meta["reference"]
         assert early and early[0]["task"] == "grpo" and early[0]["loss_type"] == "dapo"
 
+    def test_data_seed_is_recorded_as_configured_and_moves_nothing(self, tmp_path,
+                                                                   monkeypatch):
+        """The order follows training.seed, as TRL's RepeatSampler does; data_seed
+        is written as the user set it (None when unset), not as the seed."""
+        def run(path, **training):
+            wrapper = _wrapper(path, monkeypatch, train=_prompt_rows(2), seed=3, **training)
+            result = wrapper.train()
+            meta = json.loads((path / "output" / "adapter_config.json").read_text())
+            return result, meta
+
+        plain, meta = run(tmp_path / "a")
+        assert (meta["seed"], meta["data_seed"]) == (3, None)
+        seeded, meta = run(tmp_path / "b", data_seed=11)
+        assert (meta["seed"], meta["data_seed"]) == (3, 11)
+        assert seeded["losses"] == plain["losses"]
+
     def test_beta_zero_metadata_names_no_reference(self, tmp_path, monkeypatch):
         _wrapper(tmp_path, monkeypatch, train=_prompt_rows(1), grpo_beta=0.0).train()
         meta = json.loads((tmp_path / "output" / "adapter_config.json").read_text())
@@ -1127,7 +1234,7 @@ class TestTraining:
 
     def test_resume_is_refused(self, tmp_path, monkeypatch):
         wrapper = _wrapper(tmp_path, monkeypatch)
-        with pytest.raises(ValueError, match="#1977"):
+        with pytest.raises(ValueError, match="resume is not implemented for MLX GRPO"):
             wrapper.train(resume_from_checkpoint=str(tmp_path / "x.safetensors"))
 
     def test_a_quantized_base_is_refused(self, tmp_path, monkeypatch):
@@ -1259,6 +1366,16 @@ class TestData:
         with pytest.raises(ValueError, match="must be divisible by num_generations"):
             wrapper.setup({"train": _prompt_rows(8)})
 
+    @pytest.mark.parametrize("spec, name", [("accuracy", "accuracy"),
+                                            ("' accuracy'", "accuracy"),
+                                            ("'accuracy '", "accuracy"),
+                                            ("format", "format")])
+    def test_the_reward_name_is_stripped_as_at_load(self, monkeypatch, spec, name):
+        """The load check strips reward_fn, and so does the transformers path."""
+        wrapper = _setup_wrapper(monkeypatch, reward_fn=spec)
+        wrapper._prepare({"train": _prompt_rows(4)})
+        assert wrapper._reward_name == name
+
     def test_batch_size_auto_is_one_group(self, monkeypatch):
         wrapper = _setup_wrapper(monkeypatch, batch_size="auto", gradient_accumulation_steps=1)
         wrapper._prepare({"train": _prompt_rows(2)})
@@ -1299,6 +1416,12 @@ class TestData:
 # --------------------------------------------------------------------------
 
 
+#: One load-time cell per ``_MLX_GRPO_UNAPPLIED_PREFIXES`` entry, on a field the
+#: older gates do not refuse first.
+_PREFIX_CELLS = ["reward_hack_halt: true", "echo_trap_threshold: 0.7",
+                 "rl_checkpoint_keep_last: 2", "curriculum_buckets: 8"]
+
+
 class TestConfig:
     def test_grpo_on_mlx_loads_with_inactive_defaults_and_dispatches(self):
         from soup_cli.config.loader import load_config_from_string
@@ -1327,9 +1450,10 @@ output: ./output
         ("eval_steps: 5", "training.eval_steps is not applied by task='grpo' on backend='mlx'"),
         ("echo_trap_enabled: true", "training.echo_trap_enabled is not applied"),
         ("rl_checkpoint_save_every_steps: 5", "rl_checkpoint_save_every_steps is not applied"),
-        ("quantize_ref_model: true", "quantize_ref_model is not applied"),
         ("curriculum: true", "training.curriculum is not applied"),
-        ("grpo_variant: gspo", "grpo_variant is not supported on backend=mlx"),
+        ("grpo_variant: gspo", "grpo_variant is not supported on backend=mlx: MLX GRPO trains "
+         "TRL's default objective (loss_type='dapo') only. Remove training.grpo_variant, or "
+         "use backend: transformers."),
         ("prm_reward: ./prm", "prm_reward requires backend='transformers'"),
         ("vllm_sleep_mode: true", "vllm_sleep_mode requires backend"),
         ("use_lorafa: true", "use_lorafa requires backend='transformers'"),
@@ -1347,7 +1471,6 @@ output: ./output
         "tis_threshold: 2.0", "skip_zero_advantage: true", "off_policy_mask_threshold: 0.5",
         "grpo_fp16: true", "async_grpo_prefetch: true", "ref_model_ema_alpha: 0.9",
         "replay_buffer_size: 8", "defer_rerolling: true", "rollout_backend: openenv",
-        "long_context_grpo: true",
     ])
     def test_older_gates_defer_to_the_mlx_grpo_refusal_with_its_remedy(self, line):
         """The v0.50.0 gates used to answer first, with no remedy (review of #1976)."""
@@ -1359,12 +1482,50 @@ output: ./output
         assert f"Remove training.{key}, or use backend: transformers." in message
         assert "v0.50.0" not in message
 
+    @pytest.mark.parametrize("key", ["long_context_grpo", "vision_grpo", "quantize_ref_model"])
+    def test_fields_read_by_nothing_get_the_staged_refusal(self, key):
+        """#808 refuses these on every backend as of v0.77, so MLX GRPO adds no
+        refusal of its own and they are not in _MLX_GRPO_UNAPPLIED."""
+        from soup_cli.config.schema import _MLX_GRPO_UNAPPLIED
+
+        with pytest.raises(Exception) as info:
+            _config(**{key: "true"})
+        message = " ".join(str(info.value).split())
+        assert f"training.{key} is accepted but read by nothing" in message
+        assert key not in _MLX_GRPO_UNAPPLIED
+
     @pytest.mark.parametrize("key", ["tis_threshold", "skip_zero_advantage",
                                      "off_policy_mask_threshold", "mask_truncated_completions"])
     def test_record_only_fields_say_the_transformers_path_only_records_them(self, key):
         from soup_cli.config.schema import _MLX_GRPO_UNAPPLIED
 
         assert _MLX_GRPO_UNAPPLIED[key].startswith("the transformers path only")
+
+    @pytest.mark.parametrize("line", _PREFIX_CELLS)
+    def test_each_prefix_is_refused_with_its_reason(self, line):
+        from soup_cli.config.schema import _MLX_GRPO_UNAPPLIED_PREFIXES
+
+        key, value = line.split(": ", 1)
+        why = next(r for p, r in _MLX_GRPO_UNAPPLIED_PREFIXES.items() if key.startswith(p))
+        with pytest.raises(Exception) as info:
+            _config(**{key: value})
+        assert (f"training.{key} is not applied by task='grpo' on backend='mlx': {why}. "
+                f"Remove training.{key}, or use backend: transformers.") in _plain(
+                    str(info.value))
+
+    def test_every_prefix_has_a_cell_and_every_entry_names_a_field(self):
+        from soup_cli.config.schema import (
+            _MLX_GRPO_UNAPPLIED,
+            _MLX_GRPO_UNAPPLIED_PREFIXES,
+            TrainingConfig,
+        )
+
+        fields = set(TrainingConfig.model_fields)
+        assert set(_MLX_GRPO_UNAPPLIED) <= fields
+        for prefix in _MLX_GRPO_UNAPPLIED_PREFIXES:
+            assert any(name.startswith(prefix) for name in fields), prefix
+        assert {next(p for p in _MLX_GRPO_UNAPPLIED_PREFIXES if c.startswith(p))
+                for c in _PREFIX_CELLS} == set(_MLX_GRPO_UNAPPLIED_PREFIXES)
 
     def test_the_older_gates_are_unchanged_elsewhere(self):
         from soup_cli.config.loader import load_config_from_string
@@ -1388,15 +1549,28 @@ output: ./output
                                               use_ring_attention=False)
 
     def test_reward_verifiable_is_refused(self):
-        with pytest.raises(Exception, match="reward_fn='verifiable' is not supported"):
+        with pytest.raises(Exception) as info:
             _config(reward_fn="verifiable", verifiable_domain="math")
+        message = _plain(str(info.value))
+        assert ("training.reward_fn='verifiable' is not supported by task='grpo' on "
+                "backend='mlx': MLX GRPO scores with the built-in 'accuracy' or 'format' "
+                "reward only. Use one of them, or backend: transformers.") in message
+        assert "does not load custom reward files" not in message
 
-    def test_vision_modality_is_refused(self):
+    @pytest.mark.parametrize("extra", [""])
+    def test_vision_modality_is_refused(self, extra):
+        """The MLX GRPO refusal, not the v0.50.0 gate's."""
         from soup_cli.config.loader import load_config_from_string
 
-        with pytest.raises(Exception, match="modality='vision' is not supported by task='grpo'"):
-            load_config_from_string(_GRPO_YAML.replace("backend: mlx\n",
-                                                       "backend: mlx\nmodality: vision\n"))
+        text = _GRPO_YAML.replace("backend: mlx\n", "backend: mlx\nmodality: vision\n")
+        with pytest.raises(Exception) as info:
+            load_config_from_string(text.replace("  quantization: none\n",
+                                                 "  quantization: none\n" + extra))
+        message = " ".join(str(info.value).split())
+        assert ("modality='vision' is not supported by task='grpo' on backend='mlx': MLX "
+                "GRPO trains on text prompts only. Use backend=transformers, or modality: "
+                "text.") in message
+        assert "v0.50.0" not in message
 
     def test_the_transformers_route_is_unchanged(self):
         from soup_cli.config.loader import load_config_from_string
@@ -1416,6 +1590,27 @@ output: ./output
                                                    "  quantization: none\n  use_galore: true\n"))
         assert {e.field for e in check_config(cfg)} == {"training.use_galore"}
 
+    def test_every_doctor_row_can_load_and_is_reported(self):
+        """Doctor rows only for settings a GRPO config on MLX can carry (#755, #1330)."""
+        from soup_cli.config.backend_support import check_config, unsupported_for
+
+        fields = [e.field for e in unsupported_for("grpo", "mlx")]
+        assert fields
+        for field in fields:
+            cfg = _config(**{field.split(".", 1)[1]: "true"})
+            assert [e.field for e in check_config(cfg)] == [field]
+
+    @pytest.mark.parametrize("line", ["use_lorafa: true", "use_flash_attn: true",
+                                      "use_liger: true", "neftune_alpha: 5.0",
+                                      "quantization_aware: true"])
+    def test_settings_refused_at_load_have_no_doctor_row(self, line):
+        from soup_cli.config.backend_support import unsupported_for
+
+        key, value = line.split(": ", 1)
+        with pytest.raises(Exception, match=key):
+            _config(**{key: value})
+        assert f"training.{key}" not in {e.field for e in unsupported_for("grpo", "mlx")}
+
     def test_the_ignored_settings_are_printed_without_the_template(self, monkeypatch):
         from io import StringIO
 
@@ -1431,8 +1626,31 @@ output: ./output
         cfg = load_config_from_string(text.replace("  quantization: none\n",
                                                    "  quantization: none\n  use_galore: true\n"))
         MLXGRPOTrainerWrapper(cfg)._check_unsupported()
-        printed = buffer.getvalue()
+        printed = _plain(buffer.getvalue())
         assert "MLX backend ignores: GaLore" in printed and "chat_template" not in printed
+
+    def test_mlx_trainers_on_the_dpo_helpers_declare_what_those_read(self):
+        """Every MLX task whose declared modules include mlx_dpo.py also declares the
+        trainer modules mlx_dpo.py imports (KTO lost two when GRPO's row landed)."""
+        import ast
+        from pathlib import Path
+
+        from soup_cli.config.backend_support import TRAINER_MODULES
+        from soup_cli.trainer import mlx_dpo
+
+        tree = ast.parse(Path(mlx_dpo.__file__).read_text(encoding="utf-8"))
+        imported = {
+            node.module.replace(".", "/") + ".py" for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom) and node.module
+            and node.module.startswith("soup_cli.trainer.")
+        }
+        assert {"soup_cli/trainer/_trl_compat.py", "soup_cli/trainer/loss_summary.py"} <= imported
+        users = {key: set(mods) for key, mods in TRAINER_MODULES.items()
+                 if "soup_cli/trainer/mlx_dpo.py" in mods}
+        assert {task for task, _, _ in users} == {"dpo", "simpo", "orpo", "kto", "grpo"}
+        missing = {key: sorted(imported - mods) for key, mods in users.items()
+                   if imported - mods}
+        assert missing == {}
 
     def test_cli_resume_is_refused_before_anything_loads(self, capsys):
         import typer
@@ -1441,7 +1659,30 @@ output: ./output
 
         with pytest.raises(typer.Exit):
             _resolve_resume_or_exit("auto", _config())
-        assert "#1977" in capsys.readouterr().out
+        assert ("--resume is not supported for task 'grpo' on backend 'mlx': resume is not "
+                "implemented for MLX GRPO.") in _plain(capsys.readouterr().out)
+
+    @pytest.mark.parametrize("args, flag", [
+        (["--resume", "auto"], "--resume"),
+        (["--hf-resume", "--push-as", "org/repo"], "--hf-resume"),
+    ])
+    def test_train_refuses_each_resume_flag(self, tmp_path, monkeypatch, args, flag):
+        from typer.testing import CliRunner
+
+        from soup_cli.cli import app
+        from soup_cli.trainer.mlx_grpo import RESUME_REFUSAL
+
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "x.jsonl").write_text(
+            "".join(json.dumps(row) + "\n" for row in _prompt_rows(8)), encoding="utf-8")
+        (tmp_path / "soup.yaml").write_text(_GRPO_YAML, encoding="utf-8")
+        result = CliRunner().invoke(app, ["train", "--config", "soup.yaml", *args, "--yes"])
+        output = _plain(result.output)
+        assert result.exit_code == 1, output
+        assert (f"{flag} is not supported for task 'grpo' on backend 'mlx': resume is not "
+                "implemented for MLX GRPO.") in output
+        assert _plain(RESUME_REFUSAL.replace("--resume", flag, 1)) in output
+        assert "#1977" not in RESUME_REFUSAL
 
 
 # --------------------------------------------------------------------------
@@ -1533,7 +1774,7 @@ class TestHeldOutPrompts:
         buffer = StringIO()
         monkeypatch.setattr(mlx_grpo, "console", Console(file=buffer, width=400))
         _wrapper(tmp_path, monkeypatch, val=_prompt_rows(3, prefix="v")).train()
-        text = " ".join(buffer.getvalue().split())
+        text = _plain(buffer.getvalue())
         assert ("MLX GRPO: 3 prompt(s) are held out for validation (data.val_split=0.1; "
                 "on backend: mlx the loader always holds the split out)") in text
         assert ("Set data.val_split: 0 to train on every prompt, as transformers GRPO does "
@@ -1549,7 +1790,7 @@ class TestHeldOutPrompts:
         buffer = StringIO()
         monkeypatch.setattr(mlx_grpo, "console", Console(file=buffer, width=400))
         _wrapper(tmp_path, monkeypatch, train=_prompt_rows(1)).train()
-        assert "held out" not in buffer.getvalue()
+        assert "held out" not in _plain(buffer.getvalue())
 
     def test_batch_size_auto_names_the_group(self, monkeypatch):
         from io import StringIO
@@ -1562,7 +1803,78 @@ class TestHeldOutPrompts:
         monkeypatch.setattr(mlx_grpo, "console", Console(file=buffer, width=400))
         _setup_wrapper(monkeypatch, batch_size="auto")._prepare({"train": _prompt_rows(2)})
         assert ("training.batch_size auto (1 on MLX) is below num_generations=4; using one "
-                "group, 4 completions per micro-step") in buffer.getvalue()
+                "group, 4 completions per micro-step") in _plain(buffer.getvalue())
+
+
+class TestSavingAndTheRunRecord:
+    def test_a_failed_write_leaves_no_partial_file(self, tmp_path):
+        from pathlib import Path
+
+        from soup_cli.trainer.mlx_grpo import write_atomically
+
+        target = tmp_path / "adapters.safetensors"
+
+        def fail(path):
+            Path(path).write_bytes(b"half")
+            raise OSError("disk full")
+
+        with pytest.raises(OSError, match="disk full"):
+            write_atomically(target, fail)
+        assert list(tmp_path.iterdir()) == []
+        write_atomically(target, lambda path: Path(path).write_bytes(b"whole"))
+        assert [p.name for p in tmp_path.iterdir()] == ["adapters.safetensors"]
+        assert target.read_bytes() == b"whole"
+
+    def test_a_failed_adapter_save_in_training_leaves_no_partial_file(self, tmp_path,
+                                                                       monkeypatch):
+        mx = pytest.importorskip("mlx.core")
+        wrapper = _wrapper(tmp_path, monkeypatch)
+        real = mx.save_safetensors
+
+        def fail(path, weights):
+            real(path, weights)
+            raise OSError("disk full")
+
+        monkeypatch.setattr(mx, "save_safetensors", fail)
+        with pytest.raises(OSError, match="disk full"):
+            wrapper.train()
+        assert not list((tmp_path / "output").glob("*.safetensors"))
+
+    def test_the_val_reward_row(self):
+        from soup_cli.trainer.mlx_grpo import log_val_reward
+
+        rows: list = []
+
+        class Tracker:
+            def log_metrics(self, **row):
+                rows.append(row)
+
+        log_val_reward(Tracker(), "run-1", step=4, epoch=1.0, lr=0.01, val_reward=0.5)
+        log_val_reward(Tracker(), None, step=4, epoch=1.0, lr=0.01, val_reward=0.5)
+        log_val_reward(None, "run-1", step=4, epoch=1.0, lr=0.01, val_reward=0.5)
+        assert rows == [{"run_id": "run-1", "step": 4, "epoch": 1.0, "loss": None,
+                         "lr": 0.01, "val_reward": 0.5}]
+
+        class Broken:
+            def log_metrics(self, **row):
+                raise RuntimeError("db locked")
+
+        log_val_reward(Broken(), "run-1", step=4, epoch=1.0, lr=0.01, val_reward=0.5)
+
+    def test_training_logs_the_val_reward_to_the_tracker(self, tmp_path, monkeypatch):
+        rows: list = []
+
+        class Tracker:
+            def log_metrics(self, **row):
+                rows.append(row)
+
+        wrapper = _wrapper(tmp_path, monkeypatch, val=_prompt_rows(3, prefix="v"))
+        result = wrapper.train(tracker=Tracker(), run_id="run-1")
+        last = rows[-1]
+        assert (last["step"], last["loss"], last["val_reward"]) == (
+            result["total_steps"], None, result["val_reward"])
+        assert all(row.get("val_reward") is None for row in rows[:-1])
+        assert sum(row["loss"] is not None for row in rows) >= 1
 
 
 class TestAdapterCoverage:
@@ -1662,3 +1974,196 @@ class TestDenseCheck:
             wrapper._check_dense(wrapper.model)
         del wrapper.model["odd"]
         wrapper._check_dense(wrapper.model)
+
+
+# --------------------------------------------------------------------------
+# Second review of #1976: the loop's bookkeeping, pure where it can be
+# --------------------------------------------------------------------------
+
+
+class TestUpdateBookkeeping:
+    """The pieces of one update that need no MLX: micro-steps, the token
+    normaliser, the reported metrics, decoding and the written metadata."""
+
+    def test_micro_steps_cover_the_update_in_order(self):
+        from soup_cli.trainer.mlx_grpo import micro_slices, resolve_units
+
+        units = resolve_units(batch_size=4, accum=3, num_generations=4)
+        completions = list(range(units.completions_per_update))
+        assert [completions[part] for part in micro_slices(units)] == [
+            [0, 1, 2, 3], [4, 5, 6, 7], [8, 9, 10, 11]]
+
+    def test_the_token_count_includes_each_eos(self):
+        from soup_cli.trainer.mlx_grpo import update_token_count
+
+        assert update_token_count([[5, EOS], [5, 6, 7], [EOS]]) == 6.0
+
+    def test_kl_and_clip_ratios_are_token_means_over_the_update(self):
+        from soup_cli.trainer.mlx_grpo import update_metrics
+
+        sums = {"tokens": 10.0, "kl": 2.0, "clip_low": 1.0, "clip_high": 2.0,
+                "clip_region": 3.0}
+        common = dict(loss=0.5, rewards=[1.0, 0.0, 0.5, 0.5], group=2, reward_name="format",
+                      completions=[[5, EOS], [5, 6, 7], [EOS], [5, 6, 7, 8]],
+                      terminated=[True, False, False, False], sums=sums, num_items=10.0,
+                      skipped=1)
+        metrics = update_metrics(beta=0.1, **common)
+        assert metrics["kl"] == pytest.approx(0.2)
+        assert (metrics["clip_ratio/low_mean"], metrics["clip_ratio/high_mean"],
+                metrics["clip_ratio/region_mean"]) == pytest.approx((0.1, 0.2, 0.3))
+        assert metrics["completions/clipped_ratio"] == 0.75  # completions without EOS
+        assert (metrics["completions/mean_length"], metrics["completions/min_length"],
+                metrics["completions/max_length"]) == (2.5, 1.0, 4.0)
+        assert metrics["frac_reward_zero_std"] == 0.5 and metrics["skipped_steps"] == 1
+        assert metrics["rewards/format/mean"] == metrics["reward"] == 0.5
+        assert "kl" not in update_metrics(beta=0.0, **common)
+
+    def test_zero_std_groups_use_torch_isclose_tolerance(self):
+        """TRL counts ``isclose(std, 0)``: |std| <= 1e-8, not exact zero."""
+        from soup_cli.trainer.mlx_grpo import reward_statistics
+
+        # Sample stds: 3.5e-9 (zero), 0 (zero), 3.5e-8 (not), float round-off (zero).
+        stats = reward_statistics([0.0, 5e-9, 1.0, 1.0, 0.0, 5e-8, 0.1 + 0.2, 0.3], 2)
+        assert stats["frac_reward_zero_std"] == pytest.approx(3 / 4)
+
+    def test_completions_are_decoded_without_special_tokens(self):
+        from soup_cli.trainer.mlx_grpo import MLXGRPOTrainerWrapper
+
+        texts = MLXGRPOTrainerWrapper._decode(DigitTokenizer(), [[_IDS["4"], EOS],
+                                                                 [BOS, _IDS["2"], PAD]])
+        assert texts == ["4", "2"]
+
+    @pytest.mark.parametrize("beta", [0.1, 0.0])
+    def test_objective_metadata(self, beta):
+        from soup_cli.trainer.mlx_grpo import (
+            MLXGRPOTrainerWrapper,
+            grpo_contract,
+            resolve_units,
+        )
+
+        wrapper = MLXGRPOTrainerWrapper(_config(grpo_beta=beta))
+        wrapper._units = resolve_units(batch_size=4, accum=2, num_generations=4)
+        wrapper._reward_name = "format"
+        meta = wrapper._objective_metadata()
+        contract = grpo_contract(beta=beta, num_generations=4, max_completion_length=64)
+        assert {k: meta[k] for k in contract} == contract
+        assert (meta["task"], meta["reward_fn"], meta["skipped_steps"]) == ("grpo", "format", 0)
+        assert (meta["prompts_per_update"], meta["completions_per_update"]) == (2, 8)
+        assert meta["reference"].startswith("none" if beta == 0.0 else "base model")
+
+
+def _scripted_group(model, prompt_ids, *, num_generations, max_tokens, eos_token_id,
+                    sampler=None):
+    """Completions of 2, 3 and 4 tokens ending in EOS, then one truncated at 3."""
+    out = [([4 + i] * (i + 1) + [eos_token_id], True) for i in range(num_generations - 1)]
+    return out + [([5, 6, 7], False)]
+
+
+class TestTheLoopsBookkeeping:
+    def test_num_items_and_rewards_see_every_token_and_no_special_text(self, tmp_path,
+                                                                        monkeypatch):
+        """The normaliser is every completion token, EOS included; rewards read the
+        text with special tokens skipped and the ids with EOS kept."""
+        from soup_cli.trainer import mlx_grpo
+        from soup_cli.trainer.rewards import validate_reward_funcs
+
+        monkeypatch.setattr(mlx_grpo, "generate_group", _scripted_group)
+        seen = []
+
+        def reward(completions, completion_ids, **_):
+            seen.extend(zip([c[0]["content"] for c in completions], completion_ids))
+            return [float(len(ids)) for ids in completion_ids]
+
+        wrapper = _wrapper(tmp_path, monkeypatch, train=_prompt_rows(2), grpo_beta=0.0)
+        wrapper._prepare(wrapper._dataset)
+        wrapper._reward_fn = validate_reward_funcs(reward)
+        result = wrapper.train()
+        assert [h["num_items"] for h in result["history"]] == [2 + 3 + 4 + 3] * 2
+        assert all(math.isfinite(x) for x in result["losses"])
+        assert len(seen) == 8 and sum(ids[-1] == EOS for _, ids in seen) == 6
+        assert all("$" not in text and text for text, _ in seen)
+
+    def test_the_schedule_spans_updates_not_micro_steps(self, tmp_path, monkeypatch):
+        from soup_cli.trainer import mlx_optim
+
+        seen = []
+        real = mlx_optim.plan_optimizer
+
+        def plan(**kwargs):
+            seen.append(kwargs["total_updates"])
+            return real(**kwargs)
+
+        monkeypatch.setattr(mlx_optim, "plan_optimizer", plan)
+        result = _wrapper(tmp_path, monkeypatch, train=_prompt_rows(4), batch_size=4,
+                          gradient_accumulation_steps=2, scheduler="linear").train()
+        assert result["total_steps"] == 2 and seen == [2]
+
+    def test_kl_is_the_token_mean_over_every_micro_step(self, tmp_path, monkeypatch):
+        mx = pytest.importorskip("mlx.core")
+        from soup_cli.trainer import mlx_grpo
+
+        calls = []
+        real = mlx_grpo.grpo_token_loss
+
+        def loss(logps, advantages, mask, **kwargs):
+            value, sums = real(logps, advantages, mask, **kwargs)
+            calls.append((mx.stop_gradient(sums["kl"]), mask.sum()))
+            return value, sums
+
+        monkeypatch.setattr(mlx_grpo, "grpo_token_loss", loss)
+        result = _wrapper(tmp_path, monkeypatch, train=_prompt_rows(4), batch_size=4,
+                          gradient_accumulation_steps=2, lr=0.2).train()
+        last = calls[-2:]
+        kl = sum(k.item() for k, _ in last) / sum(n.item() for _, n in last)
+        assert kl > 1e-6 and result["kl"] == pytest.approx(kl, rel=1e-5)
+
+    def test_validation_samples_in_eval_mode(self, tmp_path, monkeypatch):
+        """With LoRA dropout on, validation is the eval-mode model's sampling."""
+        mx = pytest.importorskip("mlx.core")
+        from soup_cli.trainer import mlx_grpo
+
+        real = mlx_grpo.generate_group
+        calls = []
+
+        def spy(model, prompt_ids, **kwargs):
+            out = real(model, prompt_ids, **kwargs)
+            calls.append((bool(model.training), list(prompt_ids), out))
+            return out
+
+        monkeypatch.setattr(mlx_grpo, "generate_group", spy)
+        wrapper = _wrapper(tmp_path, monkeypatch, train=_prompt_rows(2),
+                           val=_prompt_rows(2, prefix="v"), seed=5,
+                           lora="{r: 4, alpha: 8, dropout: 0.3}")
+        wrapper.train()
+        val = [c for c in calls if not c[0]]
+        assert len(calls) == 4 and calls[2:] == val, "rollouts train, validation evaluates"
+
+        def replay(train_mode):
+            wrapper.model.train(train_mode)
+            mx.random.seed(5)
+            return [real(wrapper.model, ids, num_generations=4, max_tokens=64,
+                         eos_token_id=EOS) for _, ids, _ in val]
+
+        assert replay(False) == [out for *_, out in val]
+        assert replay(True) != replay(False), "dropout must change the sampling"
+
+    def test_gradient_checkpointing_trains_the_same_update(self, tmp_path, monkeypatch):
+        pytest.importorskip("mlx_lm")
+        from mlx_lm.models import llama
+
+        # mlx-lm's grad_checkpoint patches the block class process-wide; the
+        # monkeypatch restores it after this test.
+        original = llama.TransformerBlock.__call__
+        monkeypatch.setattr(llama.TransformerBlock, "__call__", original)
+
+        def run(path, **training):
+            wrapper = _wrapper(path, monkeypatch, train=_prompt_rows(2), seed=3, **training)
+            return wrapper.train(), _flat(wrapper.model.trainable_parameters())
+
+        plain, w_plain = run(tmp_path / "a")
+        assert llama.TransformerBlock.__call__ is original
+        ckpt, w_ckpt = run(tmp_path / "b", gradient_checkpointing="true")
+        assert llama.TransformerBlock.__call__ is not original
+        np.testing.assert_allclose(ckpt["losses"], plain["losses"], rtol=1e-4, atol=1e-6)
+        for name in w_plain:
+            np.testing.assert_allclose(w_ckpt[name], w_plain[name], atol=1e-5, err_msg=name)

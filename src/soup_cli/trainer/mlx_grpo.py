@@ -70,10 +70,11 @@ MASK_TRUNCATED_COMPLETIONS = False
 
 #: The refusal behind ``--resume`` for this task on this backend.
 RESUME_REFUSAL = (
-    "--resume is not supported for task 'grpo' on backend 'mlx' yet (#1977): a "
-    "GRPO run's state is its adapter, optimizer moments, step count and prompt "
-    "order, and this backend saves only the adapter, so a restart would not "
-    "continue the same run. Start a fresh run, or use backend: transformers."
+    "--resume is not supported for task 'grpo' on backend 'mlx': resume is not "
+    "implemented for MLX GRPO. A GRPO run's state is its adapter, optimizer "
+    "moments, step count and prompt order, and this backend saves only the "
+    "adapter, so a restart would not continue the same run. Start a fresh run, "
+    "or use backend: transformers."
 )
 
 
@@ -150,6 +151,17 @@ def resolve_units(*, batch_size: int, accum: int, num_generations: int) -> GrpoU
     return GrpoUnits(batch_size, accum, num_generations, bumped)
 
 
+def micro_slices(units: GrpoUnits) -> list:
+    """The completions each micro-step of one update trains on, in order."""
+    step = units.completions_per_step
+    return [slice(m * step, (m + 1) * step) for m in range(units.accum)]
+
+
+def update_token_count(completions: list) -> float:
+    """TRL's ``num_items_in_batch``: every completion token of the update, EOS included."""
+    return float(sum(len(c) for c in completions))
+
+
 def plan_prompt_updates(*, n_prompts: int, prompts_per_update: int, epochs: int,
                         seed: int) -> list:
     """Each update's prompt indices: a seeded shuffle per epoch, whole chunks only.
@@ -174,6 +186,35 @@ def plan_prompt_updates(*, n_prompts: int, prompts_per_update: int, epochs: int,
         rng.shuffle(order)
         plan.extend(order[i : i + per] for i in range(0, n_prompts - per + 1, per))
     return plan
+
+
+def write_atomically(path: Path, write: Callable[[str], None]) -> None:
+    """``write`` to ``<stem>.partial.safetensors``, then rename it over ``path``.
+
+    A failed write leaves neither a half-written ``path`` nor the partial file.
+    """
+    partial = path.with_name(path.stem + ".partial.safetensors")
+    try:
+        write(str(partial))
+        partial.replace(path)
+    finally:
+        partial.unlink(missing_ok=True)
+
+
+def log_val_reward(tracker: Any, run_id: Optional[str], *, step: int, epoch: float,
+                   lr: float, val_reward: float) -> None:
+    """The held-out reward as the run's ``val_reward`` row, as transformers GRPO logs it.
+
+    Its own row at the last update's step, with no training loss: the update's
+    loss was logged on its own row already.
+    """
+    if tracker is None or not run_id:
+        return
+    try:
+        tracker.log_metrics(run_id=run_id, step=step, epoch=epoch, loss=None, lr=lr,
+                            val_reward=float(val_reward))
+    except Exception:  # noqa: BLE001 — telemetry must not kill a run
+        pass
 
 
 # --------------------------------------------------------------------------
@@ -257,6 +298,37 @@ def score_completions(reward_fn: Callable, rows: list, texts: list, completion_i
         completion_ids=[list(ids) for ids in completion_ids], **kwargs,
     )
     return [float(s) for s in scores]
+
+
+def update_metrics(*, loss: float, rewards: list, group: int, reward_name: str,
+                   completions: list, terminated: list, sums: dict, num_items: float,
+                   skipped: int, beta: float) -> dict:
+    """One update's reported metrics.
+
+    ``sums`` are :func:`grpo_token_loss`'s masked sums added over the update's
+    micro-steps, so KL and the clip ratios are token means over the whole update.
+    """
+    lengths = [len(c) for c in completions]
+    tokens_seen = max(1.0, sums.get("tokens", 0.0))
+    stats = reward_statistics(rewards, group)
+    metrics = {
+        "loss": loss,
+        **stats,
+        f"rewards/{reward_name}/mean": stats["reward"],
+        f"rewards/{reward_name}/std": stats["reward_std"],
+        "completions/mean_length": sum(lengths) / len(lengths),
+        "completions/min_length": float(min(lengths)),
+        "completions/max_length": float(max(lengths)),
+        "completions/clipped_ratio": terminated.count(False) / len(terminated),
+        "clip_ratio/low_mean": sums.get("clip_low", 0.0) / tokens_seen,
+        "clip_ratio/high_mean": sums.get("clip_high", 0.0) / tokens_seen,
+        "clip_ratio/region_mean": sums.get("clip_region", 0.0) / tokens_seen,
+        "num_items": num_items,
+        "skipped_steps": skipped,
+    }
+    if beta != 0.0:
+        metrics["kl"] = sums.get("kl", 0.0) / tokens_seen
+    return metrics
 
 
 # --------------------------------------------------------------------------
@@ -496,7 +568,8 @@ class MLXGRPOTrainerWrapper(MLXDPOTrainerWrapper):
         from soup_cli.trainer.rewards import BUILTIN_REWARDS, validate_reward_funcs
 
         tcfg = self.config.training
-        name = str(tcfg.reward_fn)
+        # Stripped as the load check and the transformers path (load_reward_fns) strip it.
+        name = str(tcfg.reward_fn).strip()
         if name not in BUILTIN_REWARDS:
             raise ValueError(
                 f"MLX GRPO scores with the built-in rewards only ({', '.join(BUILTIN_REWARDS)}); "
@@ -775,14 +848,17 @@ class MLXGRPOTrainerWrapper(MLXDPOTrainerWrapper):
         loss_and_grad = nn.value_and_grad(self.model, loss_fn)
 
         def save(path: Path) -> None:
-            partial = path.with_name(path.stem + ".partial.safetensors")
-            mx.save_safetensors(str(partial), dict(tree_flatten(self.model.trainable_parameters())))
-            partial.replace(path)
+            weights = dict(tree_flatten(self.model.trainable_parameters()))
+            write_atomically(path, lambda target: mx.save_safetensors(target, weights))
+
+        # Recorded as configured: the prompt order follows training.seed alone, as
+        # TRL's RepeatSampler does on the transformers path, so data_seed moves nothing.
+        data_seed = None if tcfg.data_seed is None else int(tcfg.data_seed)
 
         def write_config() -> None:
             self._write_adapter_config(
                 output_dir, batch_size=step_size, iters=total_updates * accum, accum=accum,
-                optimizer_plan=optimizer_plan, seed=seed, data_seed=seed,
+                optimizer_plan=optimizer_plan, seed=seed, data_seed=data_seed,
             )
 
         self._skipped = 0
@@ -810,12 +886,11 @@ class MLXGRPOTrainerWrapper(MLXDPOTrainerWrapper):
                 rewards = score_completions(self._reward_fn, rows, texts, completions, group)
                 advantages = group_advantages(rewards, group)
                 samples = [(prompt_ids[k // group], c) for k, c in enumerate(completions)]
-                num_items = float(sum(len(c) for c in completions))
+                num_items = update_token_count(completions)
 
                 grads, loss_total = None, 0.0
                 sums: dict = {}
-                for micro in range(accum):
-                    part = slice(micro * step_size, (micro + 1) * step_size)
+                for part in micro_slices(units):
                     tokens, mask, start = collate_completions(samples[part])
                     tokens, mask = mx.array(tokens), mx.array(mask)
                     ref = self._reference_logps(tokens, start) if beta != 0.0 else None
@@ -853,26 +928,12 @@ class MLXGRPOTrainerWrapper(MLXDPOTrainerWrapper):
                 if save_steps > 0 and update % save_steps == 0:
                     save(output_dir / f"{update:07d}_adapters.safetensors")
 
-                lengths = [len(c) for c in completions]
-                tokens_seen = max(1.0, sums.get("tokens", 0.0))
-                stats = reward_statistics(rewards, group)
-                metrics = {
-                    "loss": loss_total,
-                    **stats,
-                    f"rewards/{self._reward_name}/mean": stats["reward"],
-                    f"rewards/{self._reward_name}/std": stats["reward_std"],
-                    "completions/mean_length": sum(lengths) / len(lengths),
-                    "completions/min_length": float(min(lengths)),
-                    "completions/max_length": float(max(lengths)),
-                    "completions/clipped_ratio": terminated.count(False) / len(terminated),
-                    "clip_ratio/low_mean": sums.get("clip_low", 0.0) / tokens_seen,
-                    "clip_ratio/high_mean": sums.get("clip_high", 0.0) / tokens_seen,
-                    "clip_ratio/region_mean": sums.get("clip_region", 0.0) / tokens_seen,
-                    "num_items": num_items,
-                    "skipped_steps": self._skipped,
-                }
-                if beta != 0.0:
-                    metrics["kl"] = sums.get("kl", 0.0) / tokens_seen
+                metrics = update_metrics(
+                    loss=loss_total, rewards=rewards, group=group,
+                    reward_name=self._reward_name, completions=completions,
+                    terminated=terminated, sums=sums, num_items=num_items,
+                    skipped=self._skipped, beta=beta,
+                )
                 history.append(metrics)
 
                 if update % logging_steps == 0 or update == total_updates:
@@ -908,6 +969,9 @@ class MLXGRPOTrainerWrapper(MLXDPOTrainerWrapper):
         if val is not None:
             result.update(val)
             console.print(f"[dim]MLX GRPO: validation reward {val['val_reward']:.4f}[/]")
+            log_val_reward(tracker, run_id, step=total_updates,
+                           epoch=total_updates / per_epoch,
+                           lr=self._current_lr(optimizer, tcfg.lr), val_reward=val["val_reward"])
         if self._skipped:
             console.print(
                 f"[yellow]MLX GRPO: {self._skipped} of {total_updates} update(s) skipped on a "
